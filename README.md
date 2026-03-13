@@ -1,1 +1,3 @@
 # nobodywantsit
+
+The game is called Nobody Wants It. In the game, the host have a list of several items, each with a prize value. At the beginning of the game, the host will reveal a list of participants, and each participant will secretly submit an item choice. After everyone has submitted, the host will then reveal who picked what, and if an item was picked by only one person, they win the item. Everyone else gets nothing. This game will be played over many iterations, and the model will be able to adapt. To do this, results of each round should be provided after it concludes. The model will be able to pick on on both individual trends and group trends, given it is provided the list of participants each round.

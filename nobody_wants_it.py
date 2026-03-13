@@ -713,57 +713,85 @@ def main():
         my_tag = f" ({my_player})" if my_player else " (not set)"
         print("─" * 42)
         print("  [1] Play a round")
-        print("  [2] View player statistics")
-        print("  [3] View known item prices")
-        print(f"  [4] My stats{my_tag}")
-        print(f"  [5] Set my player name{my_tag}")
-        print("  [6] Browse player stats")
-        print("  [7] Merge player names")
-        print("  [8] Quit")
+        print("  [2] View statistics")
+        print(f"  [3] My stats{my_tag}")
+        print("  [4] Settings")
+        print("  [5] Quit")
         choice = input("\n> ").strip()
 
         if choice == "1":
             state, player_profiles = run_round(state, model, player_profiles)
 
         elif choice == "2":
-            show_player_stats(player_profiles)
+            # ── Statistics submenu ────────────────────────────────
+            while True:
+                print("─" * 42)
+                print("  [1] Player leaderboard")
+                print("  [2] Item prices")
+                print("  [3] Browse player stats")
+                print("  [0] Back")
+                sub = input("\n> ").strip()
+
+                if sub == "1":
+                    show_player_stats(player_profiles)
+
+                elif sub == "2":
+                    if not state["item_values"]:
+                        print("  No item prices stored yet.")
+                    else:
+                        print(f"\n  {'ITEM':<35} {'PRICE':>10}")
+                        print("  " + "─" * 47)
+                        for item, val in sorted(state["item_values"].items(),
+                                                key=lambda x: -x[1]):
+                            print(f"  {item[:34]:<35} {val:>10,.0f}")
+
+                elif sub == "3":
+                    browse_player_stats(state, player_profiles)
+
+                elif sub == "0":
+                    break
+                else:
+                    print("  Invalid choice.")
 
         elif choice == "3":
-            if not state["item_values"]:
-                print("  No item prices stored yet.")
-            else:
-                print(f"\n  {'ITEM':<35} {'PRICE':>10}")
-                print("  " + "─" * 47)
-                for item, val in sorted(state["item_values"].items(), key=lambda x: -x[1]):
-                    print(f"  {item[:34]:<35} {val:>10,.0f}")
-
-        elif choice == "4":
             if not my_player:
-                print("  No player name set. Use option [5] to set it.")
+                print(f"  No player name set. Go to Settings to set it.")
             else:
                 show_my_stats(state["rounds"], state["item_values"], my_player)
 
+        elif choice == "4":
+            # ── Settings submenu ──────────────────────────────────
+            while True:
+                my_player = state.get("my_player")
+                my_tag = f" ({my_player})" if my_player else " (not set)"
+                print("─" * 42)
+                print(f"  [1] Set my player name{my_tag}")
+                print("  [2] Merge player names")
+                print("  [0] Back")
+                sub = input("\n> ").strip()
+
+                if sub == "1":
+                    print(f"\n  Current name: {my_player or '(none)'}")
+                    print("  Enter your player name (as it appears in results), or blank to keep:")
+                    raw = input("  > ").strip()
+                    if raw:
+                        canonical = canonical_player(raw, player_profiles)
+                        name = canonical if canonical else raw
+                        state["my_player"] = name
+                        save_state(state)
+                        print(f"  ✓ My player set to '{name}'.")
+                    else:
+                        print("  (unchanged)")
+
+                elif sub == "2":
+                    state, player_profiles = merge_player_names(state, player_profiles)
+
+                elif sub == "0":
+                    break
+                else:
+                    print("  Invalid choice.")
+
         elif choice == "5":
-            print(f"\n  Current name: {my_player or '(none)'}")
-            print("  Enter your player name (as it appears in results), or blank to keep:")
-            raw = input("  > ").strip()
-            if raw:
-                # Try to match against known players
-                canonical = canonical_player(raw, player_profiles)
-                name = canonical if canonical else raw
-                state["my_player"] = name
-                save_state(state)
-                print(f"  ✓ My player set to '{name}'.")
-            else:
-                print("  (unchanged)")
-
-        elif choice == "6":
-            browse_player_stats(state, player_profiles)
-
-        elif choice == "7":
-            state, player_profiles = merge_player_names(state, player_profiles)
-
-        elif choice == "8":
             print("\n  Goodbye! 🎯")
             break
 
