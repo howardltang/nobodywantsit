@@ -19,9 +19,6 @@ import json
 import os
 import numpy as np
 from collections import defaultdict
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 
 SAVE_FILE = "nwi_state.json"
 
@@ -113,56 +110,53 @@ def build_player_profiles(rounds):
 # FEATURE ENGINEERING
 # ─────────────────────────────────────────────
 
-def item_hist_stats(item, item_history):
-    h = item_history.get(item)
-    if not h or h["rounds"] == 0:
-        return 1.5, 0.3, 0
-    avg_picks = np.mean(h["pick_counts"]) if h["pick_counts"] else 1.5
-    win_rate  = h["wins"] / h["rounds"]
-    return avg_picks, win_rate, h["rounds"]
-
-def make_features(item, value, all_values, item_history, all_players, player_profiles):
-    sorted_vals = sorted(all_values)
-    n_items = len(sorted_vals)
-    percentile = sorted_vals.index(value) / max(n_items - 1, 1) if value in sorted_vals else 0.5
-    mean_v = np.mean(all_values)
-    std_v  = np.std(all_values) if len(all_values) > 1 else 1.0
-    trap   = (value - mean_v) / (std_v + 1e-6)
-
-    avg_picks, hist_win_rate, hist_rounds = item_hist_stats(item, item_history)
-
-    win_rates   = [player_profiles.get(p, {}).get("win_rate", 0.1)   for p in all_players]
-    contrarians = [player_profiles.get(p, {}).get("contrarian", 0.0) for p in all_players]
-    activities  = [player_profiles.get(p, {}).get("picks", 1)        for p in all_players]
-    n_players   = len(all_players)
-    n_exp       = sum(1 for p in all_players if player_profiles.get(p, {}).get("picks", 0) >= 5)
-
-    return [
-        value,
-        percentile,
-        trap,
-        avg_picks,       # historical avg pickers — a legitimate predictor
-        hist_win_rate,   # historical solo-win rate for this item
-        hist_rounds,     # how many times this item has appeared
-        n_items,
-        n_players,
-        np.mean(win_rates)   if win_rates   else 0.1,
-        np.std(win_rates)    if win_rates   else 0.0,
-        np.mean(contrarians) if contrarians else 0.0,
-        np.mean(activities)  if activities  else 1.0,
-        n_exp,
-    ]
-
 # ─────────────────────────────────────────────
-# MODEL
+# BAYESIAN P(SOLO) ESTIMATOR
 # ─────────────────────────────────────────────
+#
+# For each item we estimate P(solo win) using two signals:
+#
+#  1. Poisson(λ) model:  P(solo) = λ·e^(-λ)
+#     λ is the expected number of pickers.  When we have history,
+#     λ = observed avg picks.  When we don't, λ is inferred from
+#     the item's value rank within the round.
+#
+#  2. Beta-Binomial model:  Bayesian update of the solo win rate.
+#     Prior = Beta anchored on the Poisson estimate for this item
+#     (item-specific, not the global average).
+#     Posterior = Beta(α₀ + wins, β₀ + losses).
+#
+# Final P(solo) = blend of the two, weighted by how much history
+# exists.  With 0 rounds: Poisson only.  With 5+ rounds: ~85% Beta.
+#
+# This avoids fitting a classifier to a small, noisy dataset and
+# instead directly reasons from the observed pick distribution.
+
+PRIOR_STRENGTH = 1.5   # pseudo-observations the prior represents
+
+def _poisson_p_solo(lam):
+    """P(exactly 1 pick) under Poisson(λ)."""
+    return float(lam * np.exp(-lam))
+
+def _value_lam(value, all_values_in_round):
+    """
+    Prior λ for a new item, based on its value rank in the current round.
+    Cheap items attract fewer pickers; expensive ones attract more.
+    Scale: 0th percentile → 0.5 × baseline, 100th → 2.5 × baseline.
+    """
+    known = sorted(v for v in all_values_in_round if v > 0)
+    n = len(all_values_in_round)
+    baseline = 1.0   # we'll multiply by (n_players / n_items) at call site
+    if value > 0 and known:
+        pct = known.index(value) / max(len(known) - 1, 1) if value in known else 0.5
+    else:
+        pct = 0.5
+    return baseline * (0.5 + 2.0 * pct)   # [0.5, 2.5] × baseline
+
 
 class NWIModel:
     def __init__(self):
-        self.clf     = None
-        self.scaler  = StandardScaler()
-        self.trained = False
-        self.item_history = {}
+        self.item_history = {}   # item → {pick_counts, wins, rounds}
 
     def _rebuild_history(self, rounds):
         hist = defaultdict(lambda: {"pick_counts": [], "wins": 0, "rounds": 0})
@@ -175,82 +169,69 @@ class NWIModel:
         self.item_history = dict(hist)
 
     def train(self, rounds, player_profiles, item_values):
+        """Build item history from all past rounds (no ML fitting needed)."""
         self._rebuild_history(rounds)
-        X, y = [], []
-        rolling_hist = defaultdict(lambda: {"pick_counts": [], "wins": 0, "rounds": 0})
+        n_picks = sum(h["rounds"] for h in self.item_history.values())
+        n_wins  = sum(h["wins"]   for h in self.item_history.values())
+        print(f"  [Model] Bayesian estimator loaded "
+              f"({n_picks} picks, {n_wins} solo wins across {len(rounds)} rounds)")
 
-        for rd in rounds:
-            items = rd["items"]
-            all_vals = [item_values.get(i, 0) for i in items]
-            all_players = list({p for players in items.values() for p in players})
+    def _p_solo_for_item(self, item, value, all_values_in_round, n_players, n_items):
+        """
+        Estimate P(solo win) for one item in a round with n_players and n_items.
+        """
+        h = self.item_history.get(item)
+        baseline_lam = n_players / max(n_items, 1)
 
-            for item, players in items.items():
-                feats = make_features(
-                    item, item_values.get(item, 0), all_vals,
-                    rolling_hist, all_players, player_profiles,
-                )
-                X.append(feats)
-                y.append(1 if len(players) == 1 else 0)
+        if h and h["rounds"] > 0:
+            n_obs    = h["rounds"]
+            wins     = h["wins"]
+            avg_pick = np.mean(h["pick_counts"])
 
-            for item, players in items.items():
-                rolling_hist[item]["pick_counts"].append(len(players))
-                rolling_hist[item]["rounds"] += 1
-                if len(players) == 1:
-                    rolling_hist[item]["wins"] += 1
+            # Poisson estimate from observed avg picks
+            p_pois = _poisson_p_solo(avg_pick)
 
-        if len(X) < 5:
-            print("  [Model] Not enough data yet — using value-rank fallback.")
-            self.trained = False
-            return
+            # Beta-Binomial: prior anchored on Poisson estimate
+            a0 = p_pois * PRIOR_STRENGTH
+            b0 = (1 - p_pois) * PRIOR_STRENGTH
+            a_post = a0 + wins
+            b_post = b0 + (n_obs - wins)
+            p_beta = a_post / (a_post + b_post)
 
-        X = np.array(X, dtype=float)
-        y = np.array(y)
-        X_s = self.scaler.fit_transform(X)
+            # Blend: weight history by n/(n+2).
+            # n=1 → 33% history; n=3 → 60%; n=5 → 71%; n=10 → 83%
+            w = n_obs / (n_obs + 2.0)
+            return w * p_beta + (1 - w) * p_pois
 
-        # Logistic Regression is more stable with small datasets.
-        # GradientBoosting only kicks in once we have enough data to generalise.
-        if len(X) >= 200 and y.sum() >= 30:
-            self.clf = GradientBoostingClassifier(
-                n_estimators=100, learning_rate=0.05, max_depth=2,
-                subsample=0.8, random_state=42
-            )
-            model_name = "GradientBoosting"
         else:
-            # C controls regularisation strength — lower = more regularised.
-            # With few samples we want strong regularisation to avoid overfitting.
-            C = min(1.0, len(X) / 50.0)
-            self.clf = LogisticRegression(max_iter=1000, C=C)
-            model_name = f"LogisticRegression(C={C:.2f})"
-        self.clf.fit(X_s, y)
-        self.trained = True
-        print(f"  [Model] {model_name} trained on {len(X)} picks "
-              f"({int(y.sum())} wins / {int((~y.astype(bool)).sum())} collisions)")
+            # No history: use value-rank to set λ, then Poisson
+            lam_scale = _value_lam(value, all_values_in_round)
+            lam = baseline_lam * lam_scale
+            return _poisson_p_solo(lam)
 
     def score_items(self, items_with_values, all_players, player_profiles):
-        all_vals = list(items_with_values.values())
-        results  = []
+        n_players = len(all_players)
+        n_items   = len(items_with_values)
+        all_vals  = list(items_with_values.values())
+        results   = []
 
         for item, value in items_with_values.items():
-            avg_picks, hist_win_rate, hist_rounds = item_hist_stats(item, self.item_history)
-
-            if not self.trained:
-                p_solo = 0.5
-            else:
-                feats = make_features(
-                    item, value, all_vals,
-                    self.item_history, all_players, player_profiles,
-                )
-                fv   = np.array([feats], dtype=float)
-                fv_s = self.scaler.transform(fv)
-                p_solo = self.clf.predict_proba(fv_s)[0][1]
-
+            p_solo = self._p_solo_for_item(item, value, all_vals, n_players, n_items)
             ev = value * p_solo
-            hist_str = (f"{hist_rounds} appearances, avg {avg_picks:.1f} picks/round"
-                        if hist_rounds > 0 else "new item")
+
+            h = self.item_history.get(item)
+            if h and h["rounds"] > 0:
+                avg = np.mean(h["pick_counts"])
+                hist_str = f"{h['rounds']} appearances, avg {avg:.1f} picks/round"
+            else:
+                hist_str = "new item"
+
             results.append({"item": item, "value": value,
                              "p_solo": p_solo, "ev": ev, "history": hist_str})
 
         return sorted(results, key=lambda x: -x["ev"])
+
+
 
 # ─────────────────────────────────────────────
 # DISPLAY
