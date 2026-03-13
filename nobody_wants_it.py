@@ -114,100 +114,105 @@ def build_player_profiles(rounds):
 # BAYESIAN P(SOLO) ESTIMATOR
 # ─────────────────────────────────────────────
 #
-# For each item we estimate P(solo win) using two signals:
+# P(solo) = P(I win this item | I pick it)
+#         = P(0 other players also pick it)
 #
-#  1. Poisson(λ) model:  P(solo) = λ·e^(-λ)
-#     λ is the expected number of pickers.  When we have history,
-#     λ = observed avg picks.  When we don't, λ is inferred from
-#     the item's value rank within the round.
+# We model the number of OTHER pickers as Poisson(λ_others), so:
+#   P(solo | you pick) = e^(-λ_others)
 #
-#  2. Beta-Binomial model:  Bayesian update of the solo win rate.
-#     Prior = Beta anchored on the Poisson estimate for this item
-#     (item-specific, not the global average).
-#     Posterior = Beta(α₀ + wins, β₀ + losses).
+# λ_others is estimated from history:
+#   - Skipped rounds (nobody picked it) → 0 others that round
+#   - Picked rounds → (total pickers - 1) others that round
+# We average across all appearances, then Bayesian-smooth toward a
+# value-based prior.
 #
-# Final P(solo) = blend of the two, weighted by how much history
-# exists.  With 0 rounds: Poisson only.  With 5+ rounds: ~85% Beta.
-#
-# This avoids fitting a classifier to a small, noisy dataset and
-# instead directly reasons from the observed pick distribution.
+# This means items skipped every round → λ_others ≈ 0 → P(solo) ≈ 100%,
+# which is exactly the right answer: "if I pick this, I'll be alone."
 
-PRIOR_STRENGTH = 1.5   # pseudo-observations the prior represents
+PRIOR_STRENGTH = 1.0   # pseudo-observations the prior represents (low = trust history fast)
 
-def _poisson_p_solo(lam):
-    """P(exactly 1 pick) under Poisson(λ)."""
-    return float(lam * np.exp(-lam))
+def _p_solo_from_lambda(lam_others):
+    """P(0 other pickers) = e^(-λ_others)."""
+    return float(np.exp(-lam_others))
 
-def _value_lam(value, all_values_in_round):
+def _value_lam_others(value, all_values_in_round, n_players):
     """
-    Prior λ for a new item, based on its value rank in the current round.
-    Cheap items attract fewer pickers; expensive ones attract more.
-    Scale: 0th percentile → 0.5 × baseline, 100th → 2.5 × baseline.
+    Prior λ_others for items with no history, based on value rank.
+    Conservatively assumes 0–3 other pickers depending on value.
+    This prior is quickly overridden once real data exists.
     """
     known = sorted(v for v in all_values_in_round if v > 0)
-    n = len(all_values_in_round)
-    baseline = 1.0   # we'll multiply by (n_players / n_items) at call site
     if value > 0 and known:
         pct = known.index(value) / max(len(known) - 1, 1) if value in known else 0.5
     else:
         pct = 0.5
-    return baseline * (0.5 + 2.0 * pct)   # [0.5, 2.5] × baseline
+    # Range: 0.1 others (cheapest) to 3.0 others (most expensive)
+    # Deliberately narrow so history dominates quickly.
+    return 0.1 + pct * 2.9
 
 
 class NWIModel:
     def __init__(self):
-        self.item_history = {}   # item → {pick_counts, wins, rounds}
+        self.item_history = {}   # item → {pick_counts, wins, rounds, skipped}
 
     def _rebuild_history(self, rounds):
-        hist = defaultdict(lambda: {"pick_counts": [], "wins": 0, "rounds": 0})
+        hist = defaultdict(lambda: {"pick_counts": [], "wins": 0, "rounds": 0, "skipped": 0})
         for rd in rounds:
             for item, players in rd["items"].items():
-                hist[item]["pick_counts"].append(len(players))
                 hist[item]["rounds"] += 1
-                if len(players) == 1:
-                    hist[item]["wins"] += 1
+                if len(players) == 0:
+                    hist[item]["skipped"] += 1
+                else:
+                    hist[item]["pick_counts"].append(len(players))
+                    if len(players) == 1:
+                        hist[item]["wins"] += 1
         self.item_history = dict(hist)
 
     def train(self, rounds, player_profiles, item_values):
         """Build item history from all past rounds (no ML fitting needed)."""
         self._rebuild_history(rounds)
-        n_picks = sum(h["rounds"] for h in self.item_history.values())
-        n_wins  = sum(h["wins"]   for h in self.item_history.values())
+        n_rounds_seen = sum(h["rounds"] for h in self.item_history.values())
+        n_wins        = sum(h["wins"]   for h in self.item_history.values())
+        n_skipped     = sum(h["skipped"] for h in self.item_history.values())
         print(f"  [Model] Bayesian estimator loaded "
-              f"({n_picks} picks, {n_wins} solo wins across {len(rounds)} rounds)")
+              f"({n_rounds_seen} item-appearances, {n_wins} solo wins, "
+              f"{n_skipped} zero-pick appearances, across {len(rounds)} rounds)")
 
     def _p_solo_for_item(self, item, value, all_values_in_round, n_players, n_items):
         """
-        Estimate P(solo win) for one item in a round with n_players and n_items.
+        P(I win | I pick this item) = P(0 other players pick it) = e^(-λ_others).
+
+        λ_others = avg number of OTHER players who pick this item per round,
+        computed over all appearances (skipped rounds contribute 0 others).
         """
         h = self.item_history.get(item)
-        baseline_lam = n_players / max(n_items, 1)
 
         if h and h["rounds"] > 0:
             n_obs    = h["rounds"]
-            wins     = h["wins"]
-            avg_pick = np.mean(h["pick_counts"])
+            n_skipped = h["skipped"]
 
-            # Poisson estimate from observed avg picks
-            p_pois = _poisson_p_solo(avg_pick)
+            # Others per round: picked rounds → (count-1), skipped rounds → 0
+            others_list = [max(c - 1, 0) for c in h["pick_counts"]] + [0] * n_skipped
+            obs_lam_others = np.mean(others_list)
 
-            # Beta-Binomial: prior anchored on Poisson estimate
-            a0 = p_pois * PRIOR_STRENGTH
-            b0 = (1 - p_pois) * PRIOR_STRENGTH
-            a_post = a0 + wins
-            b_post = b0 + (n_obs - wins)
-            p_beta = a_post / (a_post + b_post)
+            # Smooth toward value-based prior.
+            # But if observed average is 0 (nobody has ever picked it),
+            # reduce prior influence sharply — the data is clear.
+            prior_lam = _value_lam_others(value, all_values_in_round, n_players)
+            if obs_lam_others == 0:
+                # All appearances were skipped: trust this signal strongly.
+                # Give the prior weight of just 0.5 pseudo-observations.
+                w_obs = n_obs / (n_obs + 0.5)
+            else:
+                w_obs = n_obs / (n_obs + PRIOR_STRENGTH)
+            lam_others = w_obs * obs_lam_others + (1 - w_obs) * prior_lam
 
-            # Blend: weight history by n/(n+2).
-            # n=1 → 33% history; n=3 → 60%; n=5 → 71%; n=10 → 83%
-            w = n_obs / (n_obs + 2.0)
-            return w * p_beta + (1 - w) * p_pois
+            return _p_solo_from_lambda(lam_others)
 
         else:
-            # No history: use value-rank to set λ, then Poisson
-            lam_scale = _value_lam(value, all_values_in_round)
-            lam = baseline_lam * lam_scale
-            return _poisson_p_solo(lam)
+            # No history: use value rank as prior
+            lam_others = _value_lam_others(value, all_values_in_round, n_players)
+            return _p_solo_from_lambda(lam_others)
 
     def score_items(self, items_with_values, all_players, player_profiles):
         n_players = len(all_players)
@@ -221,8 +226,10 @@ class NWIModel:
 
             h = self.item_history.get(item)
             if h and h["rounds"] > 0:
-                avg = np.mean(h["pick_counts"])
-                hist_str = f"{h['rounds']} appearances, avg {avg:.1f} picks/round"
+                avg = np.mean(h["pick_counts"]) if h["pick_counts"] else 0.0
+                skip_note = f", skipped {h['skipped']}×" if h["skipped"] > 0 else ""
+                hist_str = (f"{h['rounds']} appearances, avg {avg:.1f} picks/round"
+                            + skip_note)
             else:
                 hist_str = "new item"
 
@@ -230,7 +237,6 @@ class NWIModel:
                              "p_solo": p_solo, "ev": ev, "history": hist_str})
 
         return sorted(results, key=lambda x: -x["ev"])
-
 
 
 # ─────────────────────────────────────────────
@@ -244,17 +250,28 @@ def print_banner():
 ║  Learns from every round you enter. Fresh start. ║
 ╚══════════════════════════════════════════════════╝""")
 
-def show_recommendations(results):
-    W = 66
+def show_recommendations(results, my_player=None, item_history=None):
+    W = 72
     print(f"\n{'─'*W}")
     print(f"{'#':<4} {'ITEM':<28} {'PRICE':>9} {'P(SOLO)':>8} {'EV':>10}  NOTES")
     print(f"{'─'*W}")
     for i, r in enumerate(results):
         star = " ★" if i == 0 else ""
+        notes = r['history']
+        # Annotate with my personal history on this item
+        if my_player and item_history:
+            h = item_history.get(r['item'])
+            if h:
+                my_picks   = h.get("my_picks",   0)
+                my_wins    = h.get("my_wins",    0)
+                my_collide = h.get("my_collide", 0)
+                if my_picks > 0:
+                    tag = f"  [YOU: {my_wins}W/{my_collide}C in {my_picks} picks]"
+                    notes += tag
         print(f"{i+1:<4} {r['item'][:27]:<28} {r['value']:>9,.0f} "
-              f"{r['p_solo']:>8.1%} {r['ev']:>10,.0f}  {r['history']}{star}")
+              f"{r['p_solo']:>8.1%} {r['ev']:>10,.0f}  {notes}{star}")
     print(f"{'─'*W}")
-    print("  ★ = top pick by Expected Value  |  EV = price × P(you win solo)\n")
+    print("  ★ = top pick by EV  |  EV = price × P(solo)  |  YOU: W=won, C=collision\n")
 
 def show_player_stats(player_profiles):
     rows = [(n, p) for n, p in player_profiles.items() if p.get("picks", 0) >= 3]
@@ -268,9 +285,206 @@ def show_player_stats(player_profiles):
     if not rows:
         print("  (no players with 3+ picks yet)")
 
-# ─────────────────────────────────────────────
-# ITEM NAME RESOLUTION  (typo / merge helper)
-# ─────────────────────────────────────────────
+def build_my_item_history(rounds, my_player):
+    """
+    Returns a dict: item → {my_picks, my_wins, my_collide}
+    tracking only rounds where my_player appeared in the results.
+    """
+    hist = defaultdict(lambda: {"my_picks": 0, "my_wins": 0, "my_collide": 0})
+    my_lower = my_player.lower()
+    for rd in rounds:
+        for item, players in rd["items"].items():
+            if any(p.lower() == my_lower for p in players):
+                hist[item]["my_picks"] += 1
+                if len(players) == 1:
+                    hist[item]["my_wins"] += 1
+                else:
+                    hist[item]["my_collide"] += 1
+    return dict(hist)
+
+def show_my_stats(rounds, item_values, my_player):
+    """Show a personal summary: rounds played, items picked, wins, collisions."""
+    my_lower = my_player.lower()
+    rounds_played, total_picks, total_wins, total_collide = 0, 0, 0, 0
+    item_rows = []
+
+    for rd in rounds:
+        participated = False
+        for item, players in rd["items"].items():
+            if any(p.lower() == my_lower for p in players):
+                participated = True
+                total_picks += 1
+                won = len(players) == 1
+                total_wins    += int(won)
+                total_collide += int(not won)
+                item_rows.append((item, won, len(players), item_values.get(item, 0)))
+        if participated:
+            rounds_played += 1
+
+    if total_picks == 0:
+        print(f"\n  No recorded picks found for '{my_player}'.")
+        return
+
+    win_rate = total_wins / total_picks
+    print(f"\n  ── MY STATS: {my_player} ──────────────────────────────────────")
+    print(f"  Rounds played : {rounds_played}")
+    print(f"  Items picked  : {total_picks}")
+    print(f"  Solo wins     : {total_wins}  ({win_rate:.0%})")
+    print(f"  Collisions    : {total_collide}")
+
+    print(f"\n  {'ITEM':<38} {'OUTCOME':<10} {'OTHERS':>6} {'VALUE':>12}")
+    print(f"  {'─'*70}")
+    for item, won, n_pickers, val in item_rows:
+        outcome = "🏆 WON" if won else "💥 collision"
+        others  = n_pickers - 1
+        print(f"  {item[:37]:<38} {outcome:<10} {others:>6} {val:>12,.0f}")
+    print()
+
+def show_player_detail(rounds, item_values, player_name):
+    """Show full pick history for any named player, round by round."""
+    p_lower = player_name.lower()
+    rounds_played, total_picks, total_wins, total_collide = 0, 0, 0, 0
+    item_rows = []
+
+    for i, rd in enumerate(rounds):
+        participated = False
+        for item, players in rd["items"].items():
+            if any(p.lower() == p_lower for p in players):
+                participated = True
+                total_picks += 1
+                won = len(players) == 1
+                total_wins    += int(won)
+                total_collide += int(not won)
+                item_rows.append((i + 1, item, won, len(players), item_values.get(item, 0)))
+        if participated:
+            rounds_played += 1
+
+    if total_picks == 0:
+        print(f"\n  No recorded picks found for '{player_name}'.")
+        return
+
+    win_rate = total_wins / total_picks
+    print(f"\n  ── STATS: {player_name} {'─'*max(1, 50-len(player_name))}")
+    print(f"  Rounds played : {rounds_played}")
+    print(f"  Items picked  : {total_picks}")
+    print(f"  Solo wins     : {total_wins}  ({win_rate:.0%})")
+    print(f"  Collisions    : {total_collide}")
+
+    print(f"\n  {'RD':>3}  {'ITEM':<38} {'OUTCOME':<14} {'OTHERS':>6} {'VALUE':>12}")
+    print(f"  {'─'*77}")
+    for rd_num, item, won, n_pickers, val in item_rows:
+        outcome = "🏆 WON" if won else "💥 collision"
+        others  = n_pickers - 1
+        print(f"  {rd_num:>3}  {item[:37]:<38} {outcome:<14} {others:>6} {val:>12,.0f}")
+    print()
+
+def browse_player_stats(state, player_profiles):
+    """Interactive loop: look up any player by name."""
+    # Build a sorted list of all known players for display/autocomplete
+    all_players = sorted(player_profiles.keys())
+    print(f"\n  {len(all_players)} known players. Type a name to look them up, or blank to return.")
+    print(f"  (Partial names work — e.g. 'gra' will match 'Graelk')\n")
+
+    while True:
+        raw = input("  Player name > ").strip()
+        if not raw:
+            return
+
+        # Exact match first (case-insensitive)
+        canon = canonical_player(raw, player_profiles)
+        if canon:
+            show_player_detail(state["rounds"], state["item_values"], canon)
+            continue
+
+        # Partial match
+        matches = [p for p in all_players if raw.lower() in p.lower()]
+        if len(matches) == 1:
+            print(f"  → Matched '{matches[0]}'")
+            show_player_detail(state["rounds"], state["item_values"], matches[0])
+        elif len(matches) > 1:
+            print(f"  Multiple matches: {', '.join(matches)}")
+            print(f"  Be more specific, or type the full name.")
+        else:
+            print(f"  No player found matching '{raw}'.")
+            # Show a few names as a hint
+            sample = all_players[:12]
+            print(f"  Known players: {', '.join(sample)}"
+                  + ("..." if len(all_players) > 12 else ""))
+
+def merge_player_names(state, player_profiles):
+    """
+    Interactive: rename all occurrences of one player name into another,
+    across every round in the state file. Also updates my_player if affected.
+    """
+    all_players = sorted(player_profiles.keys())
+    print(f"\n  {len(all_players)} known players.")
+    print("  This will replace every occurrence of one name with another.")
+    print("  Both partial and exact names are accepted.\n")
+
+    def resolve(prompt):
+        """Ask for a player name with partial-match support. Returns canonical or None."""
+        while True:
+            raw = input(f"  {prompt}").strip()
+            if not raw:
+                return None
+            canon = canonical_player(raw, player_profiles)
+            if canon:
+                return canon
+            matches = [p for p in all_players if raw.lower() in p.lower()]
+            if len(matches) == 1:
+                print(f"    → Matched '{matches[0]}'")
+                return matches[0]
+            elif len(matches) > 1:
+                print(f"    Multiple matches: {', '.join(matches)} — be more specific.")
+            else:
+                print(f"    No player found matching '{raw}'.")
+                sample = all_players[:10]
+                print(f"    Known: {', '.join(sample)}" + ("..." if len(all_players) > 10 else ""))
+
+    # Get the name to absorb (the one being removed)
+    old_name = resolve("Merge FROM (name to remove) > ")
+    if old_name is None:
+        print("  (cancelled)")
+        return state, player_profiles
+
+    # Get the canonical target
+    print(f"  Merging '{old_name}' into …")
+    new_name = resolve("Merge INTO (name to keep)  > ")
+    if new_name is None:
+        print("  (cancelled)")
+        return state, player_profiles
+
+    if old_name.lower() == new_name.lower():
+        print("  Those are the same name — nothing to do.")
+        return state, player_profiles
+
+    # Confirm
+    print(f"\n  ⚠  Rename '{old_name}' → '{new_name}' across all {len(state['rounds'])} rounds?")
+    print("  Type 'yes' to confirm, or anything else to cancel:")
+    if input("  > ").strip().lower() != "yes":
+        print("  (cancelled)")
+        return state, player_profiles
+
+    # Apply across all rounds
+    old_lower = old_name.lower()
+    changed = 0
+    for rd in state["rounds"]:
+        for item, players in rd["items"].items():
+            for i, p in enumerate(players):
+                if p.lower() == old_lower:
+                    players[i] = new_name
+                    changed += 1
+
+    # Update my_player if it was the old name
+    if state.get("my_player", "").lower() == old_lower:
+        state["my_player"] = new_name
+        print(f"  ✓ Also updated 'my player' to '{new_name}'.")
+
+    save_state(state)
+    player_profiles = build_player_profiles(state["rounds"])
+    print(f"  ✓ Done. {changed} occurrence(s) renamed '{old_name}' → '{new_name}'.")
+    return state, player_profiles
+
 
 def resolve_item_name(typed_name, known_items):
     """
@@ -401,7 +615,9 @@ def run_round(state, model, player_profiles):
     print("\nWould you like a recommendation? (y/n)")
     if input("> ").strip().lower() == 'y':
         results = model.score_items(round_items, participants, player_profiles)
-        show_recommendations(results)
+        my_player = state.get("my_player")
+        my_item_hist = build_my_item_history(state["rounds"], my_player) if my_player else None
+        show_recommendations(results, my_player=my_player, item_history=my_item_hist)
         dangerous = [p for p in participants
                      if player_profiles.get(p, {}).get("win_rate", 0) >= 0.3
                      and player_profiles.get(p, {}).get("picks", 0) >= 5]
@@ -439,9 +655,17 @@ def run_round(state, model, player_profiles):
                 continue
         new_round["items"][match] = players
 
+    # Require at least one picked item to consider the round valid.
+    # (Entering zero picks could be an accidental blank submit.)
     if not new_round["items"]:
         print("  No results entered. Round not saved.")
         return state, player_profiles
+
+    # Fill in unpicked items with empty player lists so the model learns
+    # that those items were available but nobody chose them.
+    for item in items_this_round:
+        if item not in new_round["items"]:
+            new_round["items"][item] = []
 
     # Show winners
     print()
@@ -485,11 +709,17 @@ def main():
     print("\n  Ready!\n")
 
     while True:
+        my_player = state.get("my_player")
+        my_tag = f" ({my_player})" if my_player else " (not set)"
         print("─" * 42)
         print("  [1] Play a round")
         print("  [2] View player statistics")
         print("  [3] View known item prices")
-        print("  [4] Quit")
+        print(f"  [4] My stats{my_tag}")
+        print(f"  [5] Set my player name{my_tag}")
+        print("  [6] Browse player stats")
+        print("  [7] Merge player names")
+        print("  [8] Quit")
         choice = input("\n> ").strip()
 
         if choice == "1":
@@ -508,6 +738,32 @@ def main():
                     print(f"  {item[:34]:<35} {val:>10,.0f}")
 
         elif choice == "4":
+            if not my_player:
+                print("  No player name set. Use option [5] to set it.")
+            else:
+                show_my_stats(state["rounds"], state["item_values"], my_player)
+
+        elif choice == "5":
+            print(f"\n  Current name: {my_player or '(none)'}")
+            print("  Enter your player name (as it appears in results), or blank to keep:")
+            raw = input("  > ").strip()
+            if raw:
+                # Try to match against known players
+                canonical = canonical_player(raw, player_profiles)
+                name = canonical if canonical else raw
+                state["my_player"] = name
+                save_state(state)
+                print(f"  ✓ My player set to '{name}'.")
+            else:
+                print("  (unchanged)")
+
+        elif choice == "6":
+            browse_player_stats(state, player_profiles)
+
+        elif choice == "7":
+            state, player_profiles = merge_player_names(state, player_profiles)
+
+        elif choice == "8":
             print("\n  Goodbye! 🎯")
             break
 
