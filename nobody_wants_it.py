@@ -44,13 +44,27 @@ def canonical_player(name, player_profiles):
             return k
     return None
 
+def resolve_alias(name, aliases):
+    """
+    If name (case-insensitive) matches a key in the aliases dict,
+    return the canonical target name. Otherwise return name unchanged.
+    Aliases are stored as {alias_lower: canonical}.
+    """
+    return aliases.get(name.strip().lower(), name.strip())
+
 def normalise_item(name, item_values):
     """Return existing canonical key for name if present, else name.strip()."""
     return canonical_item(name, item_values) or name.strip()
 
-def normalise_player(name, player_profiles):
-    """Return existing canonical key for name if present, else name.strip()."""
-    return canonical_player(name, player_profiles) or name.strip()
+def normalise_player(name, player_profiles, aliases=None):
+    """
+    Return the canonical player name for `name`.
+    1. Apply alias substitution (e.g. 'Neuv' → 'Neuvillette')
+    2. Apply case-insensitive match against known profiles.
+    3. Fall back to the stripped input.
+    """
+    resolved = resolve_alias(name, aliases) if aliases else name.strip()
+    return canonical_player(resolved, player_profiles) or resolved
 
 # ─────────────────────────────────────────────
 # STATE  (persists across sessions)
@@ -59,10 +73,16 @@ def normalise_player(name, player_profiles):
 def load_state():
     if os.path.exists(SAVE_FILE):
         with open(SAVE_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
+        # Ensure older state files have the aliases key
+        state.setdefault("name_aliases", {})
+        state.setdefault("decay_factor", DEFAULT_DECAY)
+        return state
     return {
-        "rounds": [],        # list of {items: {item: [players]}}
-        "item_values": {},   # item -> price
+        "rounds":       [],
+        "item_values":  {},
+        "name_aliases": {},   # {alias_lowercase: canonical_name}
+        "decay_factor": DEFAULT_DECAY,
     }
 
 def save_state(state):
@@ -151,66 +171,91 @@ def _value_lam_others(value, all_values_in_round, n_players):
     return 0.1 + pct * 2.9
 
 
+DEFAULT_DECAY = 0.8   # weight of round N-1 relative to round N
+
 class NWIModel:
     def __init__(self):
-        self.item_history = {}   # item → {pick_counts, wins, rounds, skipped}
+        self.item_history = {}   # item → {appearances: [(round_idx, count)], wins: int}
+        self.n_rounds     = 0
+        self.decay        = DEFAULT_DECAY
 
     def _rebuild_history(self, rounds):
-        hist = defaultdict(lambda: {"pick_counts": [], "wins": 0, "rounds": 0, "skipped": 0})
-        for rd in rounds:
+        hist = defaultdict(lambda: {"appearances": [], "wins": 0})
+        for r_idx, rd in enumerate(rounds):
             for item, players in rd["items"].items():
-                hist[item]["rounds"] += 1
-                if len(players) == 0:
-                    hist[item]["skipped"] += 1
-                else:
-                    hist[item]["pick_counts"].append(len(players))
-                    if len(players) == 1:
-                        hist[item]["wins"] += 1
+                count = len(players)
+                hist[item]["appearances"].append((r_idx, count))
+                if count == 1:
+                    hist[item]["wins"] += 1
         self.item_history = dict(hist)
+        self.n_rounds = len(rounds)
 
-    def train(self, rounds, player_profiles, item_values):
-        """Build item history from all past rounds (no ML fitting needed)."""
+    def train(self, rounds, player_profiles, item_values, decay=None):
+        """Build item history from all past rounds."""
+        if decay is not None:
+            self.decay = decay
         self._rebuild_history(rounds)
-        n_rounds_seen = sum(h["rounds"] for h in self.item_history.values())
-        n_wins        = sum(h["wins"]   for h in self.item_history.values())
-        n_skipped     = sum(h["skipped"] for h in self.item_history.values())
+        n_appearances = sum(len(h["appearances"]) for h in self.item_history.values())
+        n_wins        = sum(h["wins"]             for h in self.item_history.values())
+        n_skipped     = sum(1 for h in self.item_history.values()
+                            for _, c in h["appearances"] if c == 0)
+        decay_str = f", decay={self.decay:.2f}" if self.decay < 1.0 else ", no decay"
         print(f"  [Model] Bayesian estimator loaded "
-              f"({n_rounds_seen} item-appearances, {n_wins} solo wins, "
-              f"{n_skipped} zero-pick appearances, across {len(rounds)} rounds)")
+              f"({n_appearances} item-appearances, {n_wins} solo wins, "
+              f"{n_skipped} zero-pick appearances, across {len(rounds)} rounds"
+              f"{decay_str})")
+
+    def _weighted_lam_others(self, appearances):
+        """
+        Compute a decay-weighted estimate of λ_others from a list of
+        (round_idx, total_pick_count) tuples.
+
+        Each appearance contributes:
+          - others = max(count - 1, 0)  (skipped rounds → 0 others)
+          - weight = decay ^ (n_rounds - 1 - round_idx)
+            so the most recent round always has weight 1.0
+
+        Returns (weighted_mean_others, effective_n) where effective_n is
+        the sum of weights (used for prior blending).
+        """
+        if not appearances:
+            return 0.0, 0.0
+
+        total_w  = 0.0
+        total_wo = 0.0
+        for r_idx, count in appearances:
+            age    = (self.n_rounds - 1) - r_idx   # 0 = most recent
+            w      = self.decay ** age
+            others = max(count - 1, 0)
+            total_w  += w
+            total_wo += w * others
+
+        weighted_mean = total_wo / total_w if total_w > 0 else 0.0
+        return weighted_mean, total_w
 
     def _p_solo_for_item(self, item, value, all_values_in_round, n_players, n_items):
         """
-        P(I win | I pick this item) = P(0 other players pick it) = e^(-λ_others).
+        P(I win | I pick this item) = e^(-λ_others).
 
-        λ_others = avg number of OTHER players who pick this item per round,
-        computed over all appearances (skipped rounds contribute 0 others).
+        λ_others is a decay-weighted mean of (total_pickers - 1) per appearance,
+        smoothed toward a value-based prior.
         """
         h = self.item_history.get(item)
 
-        if h and h["rounds"] > 0:
-            n_obs    = h["rounds"]
-            n_skipped = h["skipped"]
+        if h and h["appearances"]:
+            obs_lam, eff_n = self._weighted_lam_others(h["appearances"])
 
-            # Others per round: picked rounds → (count-1), skipped rounds → 0
-            others_list = [max(c - 1, 0) for c in h["pick_counts"]] + [0] * n_skipped
-            obs_lam_others = np.mean(others_list)
-
-            # Smooth toward value-based prior.
-            # But if observed average is 0 (nobody has ever picked it),
-            # reduce prior influence sharply — the data is clear.
             prior_lam = _value_lam_others(value, all_values_in_round, n_players)
-            if obs_lam_others == 0:
-                # All appearances were skipped: trust this signal strongly.
-                # Give the prior weight of just 0.5 pseudo-observations.
-                w_obs = n_obs / (n_obs + 0.5)
-            else:
-                w_obs = n_obs / (n_obs + PRIOR_STRENGTH)
-            lam_others = w_obs * obs_lam_others + (1 - w_obs) * prior_lam
 
+            # Reduce prior influence when item has consistently zero picks
+            all_skipped = all(c == 0 for _, c in h["appearances"])
+            pseudo = 0.5 if all_skipped else PRIOR_STRENGTH
+            w_obs  = eff_n / (eff_n + pseudo)
+
+            lam_others = w_obs * obs_lam + (1 - w_obs) * prior_lam
             return _p_solo_from_lambda(lam_others)
 
         else:
-            # No history: use value rank as prior
             lam_others = _value_lam_others(value, all_values_in_round, n_players)
             return _p_solo_from_lambda(lam_others)
 
@@ -225,16 +270,19 @@ class NWIModel:
             ev = value * p_solo
 
             h = self.item_history.get(item)
-            if h and h["rounds"] > 0:
-                avg = np.mean(h["pick_counts"]) if h["pick_counts"] else 0.0
-                skip_note = f", skipped {h['skipped']}×" if h["skipped"] > 0 else ""
-                hist_str = (f"{h['rounds']} appearances, avg {avg:.1f} picks/round"
-                            + skip_note)
+            if h and h["appearances"]:
+                n_app     = len(h["appearances"])
+                n_picked  = sum(1 for _, c in h["appearances"] if c > 0)
+                n_skipped = n_app - n_picked
+                avg = (sum(c for _, c in h["appearances"] if c > 0) / n_picked
+                       if n_picked else 0.0)
+                skip_note = f", skipped {n_skipped}×" if n_skipped else ""
+                hist_str  = f"{n_app} appearances, avg {avg:.1f} picks/round{skip_note}"
             else:
                 hist_str = "new item"
 
             results.append({"item": item, "value": value,
-                             "p_solo": p_solo, "ev": ev, "history": hist_str})
+                            "p_solo": p_solo, "ev": ev, "history": hist_str})
 
         return sorted(results, key=lambda x: -x["ev"])
 
@@ -411,7 +459,93 @@ def browse_player_stats(state, player_profiles):
             print(f"  Known players: {', '.join(sample)}"
                   + ("..." if len(all_players) > 12 else ""))
 
-def merge_player_names(state, player_profiles):
+def browse_item_pickers(state):
+    """
+    Interactive loop: look up an item and see which players have picked it
+    most often, with wins, collisions, and pick rate across appearances.
+    """
+    all_items = sorted(state["item_values"].keys())
+    # Also include items seen in rounds but not in item_values (no price set)
+    for rd in state["rounds"]:
+        for item in rd["items"]:
+            if item not in all_items:
+                all_items.append(item)
+    all_items = sorted(set(all_items))
+
+    print(f"\n  {len(all_items)} known items. Type a name to look it up, or blank to return.")
+    print(f"  (Partial names work — e.g. 'spice' will match 'spice melange')\n")
+
+    while True:
+        raw = input("  Item name > ").strip()
+        if not raw:
+            return
+
+        # Exact match first (case-insensitive)
+        canon = canonical_item(raw, state["item_values"])
+        if canon is None:
+            # Try partial match across all known items
+            matches = [i for i in all_items if raw.lower() in i.lower()]
+            if len(matches) == 1:
+                print(f"  → Matched '{matches[0]}'")
+                canon = matches[0]
+            elif len(matches) > 1:
+                print(f"  Multiple matches: {', '.join(matches[:8])}"
+                      + ("..." if len(matches) > 8 else ""))
+                print("  Be more specific, or type the full name.")
+                continue
+            else:
+                print(f"  No item found matching '{raw}'.")
+                sample = all_items[:10]
+                print(f"  Known items: {', '.join(sample)}"
+                      + ("..." if len(all_items) > 10 else ""))
+                continue
+
+        # Tally picks per player for this item
+        pick_tally  = defaultdict(lambda: {"picks": 0, "wins": 0, "collisions": 0})
+        total_appearances = 0
+        total_picked_rounds = 0
+
+        for rd in state["rounds"]:
+            players = rd["items"].get(canon)
+            if players is None:
+                continue   # item wasn't in this round at all
+            total_appearances += 1
+            if len(players) == 0:
+                continue   # item was on the board but nobody picked it
+            total_picked_rounds += 1
+            won = len(players) == 1
+            for p in players:
+                pick_tally[p]["picks"] += 1
+                if won:
+                    pick_tally[p]["wins"] += 1
+                else:
+                    pick_tally[p]["collisions"] += 1
+
+        val = state["item_values"].get(canon, 0)
+        skipped = total_appearances - total_picked_rounds
+        print(f"\n  ── ITEM: {canon} {'─'*max(1, 48-len(canon))}")
+        if val:
+            print(f"  Price         : {val:,.0f}")
+        print(f"  Appearances   : {total_appearances}")
+        print(f"  Times picked  : {total_picked_rounds}"
+              + (f"  (skipped {skipped}×)" if skipped else ""))
+
+        if not pick_tally:
+            print("  Nobody has ever picked this item.")
+            print()
+            continue
+
+        # Sort by picks desc, then wins desc
+        rows = sorted(pick_tally.items(), key=lambda x: (-x[1]["picks"], -x[1]["wins"]))
+        print(f"\n  {'PLAYER':<24} {'PICKS':>6} {'WINS':>6} {'COLLISIONS':>11} {'PICK RATE':>10}")
+        print(f"  {'─'*62}")
+        for player, t in rows:
+            pick_rate = t["picks"] / total_appearances if total_appearances else 0
+            print(f"  {player[:23]:<24} {t['picks']:>6} {t['wins']:>6} "
+                  f"{t['collisions']:>11} {pick_rate:>10.0%}")
+        print()
+
+
     """
     Interactive: rename all occurrences of one player name into another,
     across every round in the state file. Also updates my_player if affected.
@@ -484,6 +618,68 @@ def merge_player_names(state, player_profiles):
     player_profiles = build_player_profiles(state["rounds"])
     print(f"  ✓ Done. {changed} occurrence(s) renamed '{old_name}' → '{new_name}'.")
     return state, player_profiles
+
+
+def manage_aliases(state):
+    """
+    Interactive submenu for viewing, adding, and removing persistent name aliases.
+    Aliases are stored as {alias_lowercase: canonical_name} and applied automatically
+    whenever player names are read in during a round.
+    """
+    aliases = state.setdefault("name_aliases", {})
+
+    while True:
+        print("\n  ── NAME ALIASES ─────────────────────────────────────────")
+        if aliases:
+            for alias_low, canonical in sorted(aliases.items()):
+                print(f"    '{alias_low}' → '{canonical}'")
+        else:
+            print("    (no aliases defined)")
+        print()
+        print("  [1] Add alias")
+        print("  [2] Remove alias")
+        print("  [0] Back")
+        sub = input("\n  > ").strip()
+
+        if sub == "0":
+            return
+
+        elif sub == "1":
+            print("\n  Enter the alias (the name to auto-replace):")
+            alias_raw = input("  Alias > ").strip()
+            if not alias_raw:
+                print("  (cancelled)")
+                continue
+            print(f"  Enter the canonical name '{alias_raw}' should map to:")
+            canonical_raw = input("  Canonical > ").strip()
+            if not canonical_raw:
+                print("  (cancelled)")
+                continue
+            alias_key = alias_raw.lower()
+            if alias_key == canonical_raw.lower():
+                print("  Those are the same name — nothing to do.")
+                continue
+            aliases[alias_key] = canonical_raw
+            save_state(state)
+            print(f"  ✓ Alias added: '{alias_raw}' → '{canonical_raw}'")
+            print(f"    Any future occurrence of '{alias_raw}' will be saved as '{canonical_raw}'.")
+
+        elif sub == "2":
+            if not aliases:
+                print("  No aliases to remove.")
+                continue
+            print("\n  Enter the alias to remove:")
+            raw = input("  Alias > ").strip()
+            key = raw.lower()
+            if key in aliases:
+                canonical = aliases.pop(key)
+                save_state(state)
+                print(f"  ✓ Removed alias '{raw}' → '{canonical}'.")
+            else:
+                print(f"  No alias found for '{raw}'.")
+
+        else:
+            print("  Invalid choice.")
 
 
 def resolve_item_name(typed_name, known_items):
@@ -571,7 +767,7 @@ def run_round(state, model, player_profiles):
     print("│ Participants (comma-separated):                      │")
     print("└─────────────────────────────────────────────────────┘")
     raw = input("> ").strip()
-    participants = [normalise_player(p, player_profiles)
+    participants = [normalise_player(p, player_profiles, state.get("name_aliases", {}))
                    for p in raw.split(',') if p.strip()]
     if not participants:
         print("  No participants entered. Cancelling.")
@@ -640,7 +836,7 @@ def run_round(state, model, player_profiles):
             continue
         item_part, players_part = line.split(':', 1)
         item    = item_part.strip()
-        players = [normalise_player(p, player_profiles)
+        players = [normalise_player(p, player_profiles, state.get("name_aliases", {}))
                    for p in players_part.split(',') if p.strip()]
         if not item or not players:
             print("  [!] Need an item name and at least one player.")
@@ -682,8 +878,8 @@ def run_round(state, model, player_profiles):
     save_state(state)
 
     player_profiles = build_player_profiles(state["rounds"])
-    model.train(state["rounds"], player_profiles, state["item_values"])
-    print(f"\n  ✓ Saved. Database now has {len(state['rounds'])} round(s).")
+    model.train(state["rounds"], player_profiles, state["item_values"],
+                decay=state.get("decay_factor", DEFAULT_DECAY))
 
     return state, player_profiles
 
@@ -702,7 +898,8 @@ def main():
     model = NWIModel()
     if state["rounds"]:
         print("[Training on saved data...]")
-        model.train(state["rounds"], player_profiles, state["item_values"])
+        model.train(state["rounds"], player_profiles, state["item_values"],
+                    decay=state.get("decay_factor", DEFAULT_DECAY))
     else:
         print("  No rounds yet — model will train after your first round.")
 
@@ -729,6 +926,7 @@ def main():
                 print("  [1] Player leaderboard")
                 print("  [2] Item prices")
                 print("  [3] Browse player stats")
+                print("  [4] Item pick history")
                 print("  [0] Back")
                 sub = input("\n> ").strip()
 
@@ -748,6 +946,9 @@ def main():
                 elif sub == "3":
                     browse_player_stats(state, player_profiles)
 
+                elif sub == "4":
+                    browse_item_pickers(state)
+
                 elif sub == "0":
                     break
                 else:
@@ -762,11 +963,15 @@ def main():
         elif choice == "4":
             # ── Settings submenu ──────────────────────────────────
             while True:
-                my_player = state.get("my_player")
-                my_tag = f" ({my_player})" if my_player else " (not set)"
+                my_player  = state.get("my_player")
+                my_tag     = f" ({my_player})" if my_player else " (not set)"
+                decay      = state.get("decay_factor", DEFAULT_DECAY)
+                decay_tag  = f" ({decay:.2f})" + (" — recency OFF" if decay >= 1.0 else "")
                 print("─" * 42)
                 print(f"  [1] Set my player name{my_tag}")
                 print("  [2] Merge player names")
+                print("  [3] Manage name aliases")
+                print(f"  [4] Recency decay factor{decay_tag}")
                 print("  [0] Back")
                 sub = input("\n> ").strip()
 
@@ -785,6 +990,32 @@ def main():
 
                 elif sub == "2":
                     state, player_profiles = merge_player_names(state, player_profiles)
+
+                elif sub == "3":
+                    manage_aliases(state)
+
+                elif sub == "4":
+                    print(f"\n  Current decay factor: {decay:.2f}")
+                    print("  How much weight to give older rounds relative to the most recent.")
+                    print("  0.8 = round 5 sessions ago counts ~33% as much as the latest.")
+                    print("  1.0 = all rounds weighted equally (no recency bias).")
+                    print("  Enter a value between 0.5 and 1.0, or blank to keep:")
+                    raw = input("  > ").strip()
+                    if not raw:
+                        print("  (unchanged)")
+                    else:
+                        try:
+                            new_decay = float(raw)
+                            if not (0.5 <= new_decay <= 1.0):
+                                print("  [!] Value must be between 0.5 and 1.0.")
+                            else:
+                                state["decay_factor"] = new_decay
+                                save_state(state)
+                                model.train(state["rounds"], player_profiles,
+                                            state["item_values"], decay=new_decay)
+                                print(f"  ✓ Decay factor set to {new_decay:.2f}. Model retrained.")
+                        except ValueError:
+                            print("  [!] Please enter a number.")
 
                 elif sub == "0":
                     break
