@@ -26,24 +26,37 @@ Technically: the number of *other* players who pick each item is modelled as a P
 
 - Python 3.8+
 - `numpy`
+- `flask` (web UI only)
 
 ```
-pip install numpy
+pip install numpy flask
 ```
 
 ---
 
 ## Usage
 
+**Web UI (recommended)**
+
+```
+python web_nwi.py
+```
+
+Open `http://localhost:5001` in your browser.
+
+**Command-line**
+
 ```
 python nobody_wants_it.py
 ```
+
+Both can be run from any directory — the script always finds `nwi_state.json` relative to its own location.
 
 All data is saved automatically to `nwi_state.json` in the same directory. The file is created on first run.
 
 ---
 
-## Menu structure
+## Menu structure (CLI)
 
 ```
 [1] Play a round
@@ -51,11 +64,15 @@ All data is saved automatically to `nwi_state.json` in the same directory. The f
       [1] Player leaderboard
       [2] Item prices
       [3] Browse player stats
+      [4] Item pick history
       [0] Back
 [3] My stats
 [4] Settings
       [1] Set my player name
       [2] Merge player names
+      [3] Manage name aliases
+      [4] Recency decay factor
+      [5] Utility mode
       [0] Back
 [5] Quit
 ```
@@ -83,6 +100,18 @@ All data is saved automatically to `nwi_state.json` in the same directory. The f
 ```
 
 The `[YOU: ...]` annotation appears on any item you have personally picked before, showing your win/collision record on that specific item.
+
+### Utility modes
+
+The EV column can be scored three ways, configurable in Settings:
+
+| Mode | Formula | Best for |
+|------|---------|---------|
+| `linear` (default) | `price × P(solo)` | Maximum raw expected value |
+| `sqrt` | `√price × P(solo)` | Risk-adjusted — reduces dominance of extreme prices |
+| `log` | `log(price) × P(solo)` | Kelly-style — best long-run growth over many rounds |
+
+In backtesting, `sqrt` correctly identified actual solo winners ~6× more often than `linear`, because `linear` is dominated by ultra-high-value items that are always heavily contested.
 
 ---
 
@@ -116,6 +145,12 @@ The **player leaderboard** (Statistics → Player leaderboard) shows win rate an
 
 **Merge player names** — if the same person appears under multiple names across different rounds (e.g. a nickname vs a full name), this option rewrites all historical occurrences of one name to another. Partial name matching is supported. A confirmation prompt shows how many occurrences will be affected before any changes are made.
 
+**Manage name aliases** — define persistent shorthand substitutions applied automatically when entering player names (e.g. `neuv` → `Neuvillette`). Aliases are stored in the state file and applied on every round.
+
+**Recency decay factor** — controls how much weight older rounds carry relative to recent ones. `0.8` (default) means a round five sessions ago counts ~33% as much as the latest. `1.0` disables decay and weights all rounds equally.
+
+**Utility mode** — sets the scoring function used for recommendations. See the Utility modes section above.
+
 ---
 
 ## State file
@@ -125,8 +160,11 @@ All data lives in `nwi_state.json`. It contains:
 - `rounds` — list of rounds, each with an `items` dict mapping item names to lists of players who picked them (empty list = nobody picked it that round)
 - `item_values` — dict of item name → price
 - `my_player` — your player name, if set
+- `name_aliases` — dict of `{alias_lowercase: canonical_name}`
+- `decay_factor` — recency decay weight (default `0.8`)
+- `utility_mode` — scoring function for recommendations (`linear`, `sqrt`, or `log`)
 
-The file is plain JSON and can be edited by hand if needed.
+The file is plain JSON and can be edited by hand if needed. It is excluded from version control (see `.gitignore`) as it contains personal player data.
 
 ---
 
@@ -134,6 +172,7 @@ The file is plain JSON and can be edited by hand if needed.
 
 | File | Description |
 |------|-------------|
-| `nobody_wants_it.py` | Main script — run this |
-| `nwi_state.json` | Saved game data (created automatically) |
+| `nobody_wants_it.py` | CLI script |
+| `web_nwi.py` | Web UI — run this for browser access on port 5001 |
+| `nwi_state.json` | Saved game data (created automatically, excluded from git) |
 | `README.md` | This file |
