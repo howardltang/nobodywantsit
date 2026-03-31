@@ -20,7 +20,7 @@ import os
 import numpy as np
 from collections import defaultdict
 
-SAVE_FILE = "nwi_state.json"
+SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nwi_state.json")
 
 # ─────────────────────────────────────────────
 # CANONICAL NAME HELPERS
@@ -77,12 +77,14 @@ def load_state():
         # Ensure older state files have the aliases key
         state.setdefault("name_aliases", {})
         state.setdefault("decay_factor", DEFAULT_DECAY)
+        state.setdefault("utility_mode", DEFAULT_UTILITY)
         return state
     return {
         "rounds":       [],
         "item_values":  {},
         "name_aliases": {},   # {alias_lowercase: canonical_name}
         "decay_factor": DEFAULT_DECAY,
+        "utility_mode": DEFAULT_UTILITY,
     }
 
 def save_state(state):
@@ -171,7 +173,14 @@ def _value_lam_others(value, all_values_in_round, n_players):
     return 0.1 + pct * 2.9
 
 
-DEFAULT_DECAY = 0.8   # weight of round N-1 relative to round N
+DEFAULT_DECAY    = 0.8      # weight of round N-1 relative to round N
+DEFAULT_UTILITY = "linear"  # scoring function: "linear", "sqrt", or "log"
+
+UTILITY_LABELS = {
+    "linear": "EV = price × P(solo)",
+    "sqrt":   "EV = √price × P(solo)  [risk-adjusted]",
+    "log":    "EV = log(price) × P(solo)  [Kelly-style]",
+}
 
 class NWIModel:
     def __init__(self):
@@ -259,7 +268,8 @@ class NWIModel:
             lam_others = _value_lam_others(value, all_values_in_round, n_players)
             return _p_solo_from_lambda(lam_others)
 
-    def score_items(self, items_with_values, all_players, player_profiles):
+    def score_items(self, items_with_values, all_players, player_profiles,
+                    utility="linear"):
         n_players = len(all_players)
         n_items   = len(items_with_values)
         all_vals  = list(items_with_values.values())
@@ -267,7 +277,12 @@ class NWIModel:
 
         for item, value in items_with_values.items():
             p_solo = self._p_solo_for_item(item, value, all_vals, n_players, n_items)
-            ev = value * p_solo
+            if utility == "sqrt":
+                ev = float(np.sqrt(max(value, 0))) * p_solo
+            elif utility == "log":
+                ev = float(np.log1p(max(value, 0))) * p_solo
+            else:
+                ev = value * p_solo
 
             h = self.item_history.get(item)
             if h and h["appearances"]:
@@ -298,10 +313,11 @@ def print_banner():
 ║  Learns from every round you enter. Fresh start. ║
 ╚══════════════════════════════════════════════════╝""")
 
-def show_recommendations(results, my_player=None, item_history=None):
+def show_recommendations(results, my_player=None, item_history=None, utility="linear"):
     W = 72
+    ev_label = {"linear": "EV", "sqrt": "EV(√)", "log": "EV(log)"}.get(utility, "EV")
     print(f"\n{'─'*W}")
-    print(f"{'#':<4} {'ITEM':<28} {'PRICE':>9} {'P(SOLO)':>8} {'EV':>10}  NOTES")
+    print(f"{'#':<4} {'ITEM':<28} {'PRICE':>9} {'P(SOLO)':>8} {ev_label:>10}  NOTES")
     print(f"{'─'*W}")
     for i, r in enumerate(results):
         star = " ★" if i == 0 else ""
@@ -317,9 +333,10 @@ def show_recommendations(results, my_player=None, item_history=None):
                     tag = f"  [YOU: {my_wins}W/{my_collide}C in {my_picks} picks]"
                     notes += tag
         print(f"{i+1:<4} {r['item'][:27]:<28} {r['value']:>9,.0f} "
-              f"{r['p_solo']:>8.1%} {r['ev']:>10,.0f}  {notes}{star}")
+              f"{r['p_solo']:>8.1%} {r['ev']:>10,.2f}  {notes}{star}")
     print(f"{'─'*W}")
-    print("  ★ = top pick by EV  |  EV = price × P(solo)  |  YOU: W=won, C=collision\n")
+    util_desc = UTILITY_LABELS.get(utility, utility)
+    print(f"  ★ = top pick  |  {util_desc}  |  YOU: W=won, C=collision\n")
 
 def show_player_stats(player_profiles):
     rows = [(n, p) for n, p in player_profiles.items() if p.get("picks", 0) >= 3]
@@ -810,10 +827,13 @@ def run_round(state, model, player_profiles):
     # ── 4. Recommendation ────────────────────────────────────
     print("\nWould you like a recommendation? (y/n)")
     if input("> ").strip().lower() == 'y':
-        results = model.score_items(round_items, participants, player_profiles)
+        utility = state.get("utility_mode", DEFAULT_UTILITY)
+        results = model.score_items(round_items, participants, player_profiles,
+                                    utility=utility)
         my_player = state.get("my_player")
         my_item_hist = build_my_item_history(state["rounds"], my_player) if my_player else None
-        show_recommendations(results, my_player=my_player, item_history=my_item_hist)
+        show_recommendations(results, my_player=my_player, item_history=my_item_hist,
+                             utility=utility)
         dangerous = [p for p in participants
                      if player_profiles.get(p, {}).get("win_rate", 0) >= 0.3
                      and player_profiles.get(p, {}).get("picks", 0) >= 5]
@@ -967,11 +987,13 @@ def main():
                 my_tag     = f" ({my_player})" if my_player else " (not set)"
                 decay      = state.get("decay_factor", DEFAULT_DECAY)
                 decay_tag  = f" ({decay:.2f})" + (" — recency OFF" if decay >= 1.0 else "")
+                utility    = state.get("utility_mode", DEFAULT_UTILITY)
                 print("─" * 42)
                 print(f"  [1] Set my player name{my_tag}")
                 print("  [2] Merge player names")
                 print("  [3] Manage name aliases")
                 print(f"  [4] Recency decay factor{decay_tag}")
+                print(f"  [5] Utility mode ({utility})")
                 print("  [0] Back")
                 sub = input("\n> ").strip()
 
@@ -1016,6 +1038,25 @@ def main():
                                 print(f"  ✓ Decay factor set to {new_decay:.2f}. Model retrained.")
                         except ValueError:
                             print("  [!] Please enter a number.")
+
+                elif sub == "5":
+                    print(f"\n  Current utility mode: {utility}")
+                    print("  Controls how item value is weighted against P(solo) in the ranking.")
+                    print()
+                    for key, desc in UTILITY_LABELS.items():
+                        marker = " ←" if key == utility else ""
+                        print(f"    [{key}]  {desc}{marker}")
+                    print()
+                    print("  Enter 'linear', 'sqrt', or 'log', or blank to keep:")
+                    raw = input("  > ").strip().lower()
+                    if not raw:
+                        print("  (unchanged)")
+                    elif raw in UTILITY_LABELS:
+                        state["utility_mode"] = raw
+                        save_state(state)
+                        print(f"  ✓ Utility mode set to '{raw}'.")
+                    else:
+                        print("  [!] Invalid choice. Enter 'linear', 'sqrt', or 'log'.")
 
                 elif sub == "0":
                     break
