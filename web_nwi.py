@@ -678,6 +678,14 @@ MAIN_HTML = """<!DOCTYPE html>
     .suggestions { margin-bottom: .5rem; }
     .search-row  { display: flex; gap: .5rem; margin-bottom: .75rem; }
     .search-row input { flex: 1; }
+    /* Detail expand rows */
+    .detail-row > td { background: #0d1117 !important; border-bottom: 2px solid #30363d; padding: .6rem .8rem; }
+    .detail-wrap .stat-row { margin-bottom: .5rem; }
+    .detail-wrap table { margin-top: .4rem; }
+    .detail-btn { padding: .1rem .45rem; font-size: .75rem; cursor: pointer;
+                  background: transparent; border: 1px solid #30363d; color: #8b949e;
+                  border-radius: 3px; white-space: nowrap; }
+    .detail-btn:hover { border-color: #8b949e; color: #c9d1d9; }
 
     /* Settings */
     .settings-sep { font-size: .75rem; color: #484f58; text-transform: uppercase;
@@ -701,8 +709,6 @@ MAIN_HTML = """<!DOCTYPE html>
     <div class="nav-section">Statistics</div>
     <button class="nav-btn" onclick="showPanel('players', this)">Player Leaderboard</button>
     <button class="nav-btn" onclick="showPanel('items-list', this)">Item List</button>
-    <button class="nav-btn" onclick="showPanel('browse-players', this)">Browse Players</button>
-    <button class="nav-btn" onclick="showPanel('browse-items', this)">Browse Items</button>
     <div class="nav-section">Personal</div>
     <button class="nav-btn" onclick="showPanel('mystats', this)">My Stats</button>
     <div class="nav-section">Config</div>
@@ -805,6 +811,10 @@ MAIN_HTML = """<!DOCTYPE html>
     <div class="panel" id="panel-players">
       <div class="card">
         <h6>Player Leaderboard</h6>
+        <input type="text" id="players-search" placeholder="Filter by name..."
+          oninput="filterPlayers(this.value)"
+          style="margin-bottom:.6rem;max-width:240px;background:#161b22;border:1px solid #30363d;
+                 color:#c9d1d9;border-radius:4px;padding:.25rem .5rem;font-size:.85rem;width:100%">
         <div class="tbl-wrap">
           <table>
             <thead><tr>
@@ -813,6 +823,7 @@ MAIN_HTML = """<!DOCTYPE html>
               <th class="td-right sortable" onclick="sortPlayers('wins')">Wins<span class="sort-ind" id="psort-wins"> ▼</span></th>
               <th class="td-right sortable" onclick="sortPlayers('win_rate')">Win%<span class="sort-ind" id="psort-win_rate"></span></th>
               <th class="td-right sortable" onclick="sortPlayers('contrarian')">Contrarian<span class="sort-ind" id="psort-contrarian"></span></th>
+              <th></th>
             </tr></thead>
             <tbody id="players-tbody"></tbody>
           </table>
@@ -825,6 +836,10 @@ MAIN_HTML = """<!DOCTYPE html>
       <div class="card">
         <h6>Item List</h6>
         <div id="items-list-msg"></div>
+        <input type="text" id="items-search" placeholder="Filter by name..."
+          oninput="filterItems(this.value)"
+          style="margin-bottom:.6rem;max-width:240px;background:#161b22;border:1px solid #30363d;
+                 color:#c9d1d9;border-radius:4px;padding:.25rem .5rem;font-size:.85rem;width:100%">
         <div class="tbl-wrap">
           <table>
             <thead><tr>
@@ -834,64 +849,10 @@ MAIN_HTML = """<!DOCTYPE html>
               <th class="td-right sortable" onclick="sortItems('picked')">Picked<span class="sort-ind" id="isort-picked"></span></th>
               <th class="td-right sortable" onclick="sortItems('solo')">Solo<span class="sort-ind" id="isort-solo"></span></th>
               <th class="td-right sortable" onclick="sortItems('avg_pickers')">Avg Pickers<span class="sort-ind" id="isort-avg_pickers"></span></th>
+              <th></th>
             </tr></thead>
             <tbody id="items-list-tbody"></tbody>
           </table>
-        </div>
-      </div>
-    </div>
-
-    <!-- ─── BROWSE PLAYERS ─── -->
-    <div class="panel" id="panel-browse-players">
-      <div class="card">
-        <h6>Browse Player Stats</h6>
-        <div class="search-row">
-          <input type="text" id="player-search-inp" placeholder="Search player name..."
-            oninput="debouncedSearch('player', this.value)"
-            onkeydown="if(event.key==='Enter') lookupPlayer()">
-          <button class="btn btn-primary" onclick="lookupPlayer()">Look Up</button>
-        </div>
-        <div class="suggestions hidden" id="player-suggestions"></div>
-        <div id="player-detail-msg"></div>
-        <div id="player-detail" class="hidden">
-          <div class="stat-row" id="player-stat-row"></div>
-          <div class="tbl-wrap">
-            <table>
-              <thead><tr>
-                <th>Rd</th><th>Item</th><th>Outcome</th>
-                <th class="td-right">Others</th><th class="td-right">Value</th>
-              </tr></thead>
-              <tbody id="player-detail-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ─── BROWSE ITEMS ─── -->
-    <div class="panel" id="panel-browse-items">
-      <div class="card">
-        <h6>Browse Item History</h6>
-        <div class="search-row">
-          <input type="text" id="item-search-inp" placeholder="Search item name..."
-            oninput="debouncedSearch('item', this.value)"
-            onkeydown="if(event.key==='Enter') lookupItem()">
-          <button class="btn btn-primary" onclick="lookupItem()">Look Up</button>
-        </div>
-        <div class="suggestions hidden" id="item-suggestions"></div>
-        <div id="item-detail-msg"></div>
-        <div id="item-detail" class="hidden">
-          <div class="stat-row" id="item-stat-row"></div>
-          <div class="tbl-wrap">
-            <table>
-              <thead><tr>
-                <th>Player</th>
-                <th class="td-right">Picks</th><th class="td-right">Wins</th>
-                <th class="td-right">Collisions</th><th class="td-right">Pick Rate</th>
-              </tr></thead>
-              <tbody id="item-detail-tbody"></tbody>
-            </table>
-          </div>
         </div>
       </div>
     </div>
@@ -1221,15 +1182,26 @@ async function saveRound() {
 // ---------------------------------------------------------------------------
 var _playersData = [];
 var _playersSort = {col: 'wins', dir: -1};
+var _playerFilter = '';
+var _openPlayerDetail = null;
+
+function filterPlayers(val) {
+  _playerFilter = val.toLowerCase();
+  renderPlayers();
+}
 
 function renderPlayers() {
   var col = _playersSort.col;
   var dir = _playersSort.dir;
-  var sorted = _playersData.slice().sort(function(a, b) {
+  var data = _playerFilter
+    ? _playersData.filter(function(r) { return r.name.toLowerCase().includes(_playerFilter); })
+    : _playersData;
+  var sorted = data.slice().sort(function(a, b) {
     var av = a[col], bv = b[col];
     if (typeof av === 'string') return dir * av.localeCompare(bv);
     return dir * (av - bv);
   });
+  _openPlayerDetail = null;
   var tbody = document.getElementById('players-tbody');
   tbody.innerHTML = '';
   sorted.forEach(function(r) {
@@ -1238,10 +1210,16 @@ function renderPlayers() {
       '<td class="td-right">' + r.picks + '</td>' +
       '<td class="td-right">' + r.wins  + '</td>' +
       '<td class="td-right">' + pct(r.win_rate) + '</td>' +
-      '<td class="td-right">' + r.contrarian.toFixed(2) + '</td>';
+      '<td class="td-right">' + r.contrarian.toFixed(2) + '</td>' +
+      '<td class="td-right"></td>';
+    var btn = document.createElement('button');
+    btn.className = 'detail-btn';
+    btn.textContent = 'Details';
+    btn.dataset.name = r.name;
+    btn.addEventListener('click', function() { togglePlayerDetail(this.dataset.name, this); });
+    tr.lastElementChild.appendChild(btn);
     tbody.appendChild(tr);
   });
-  // Update sort indicators
   ['name','picks','wins','win_rate','contrarian'].forEach(function(c) {
     var el = document.getElementById('psort-' + c);
     if (el) el.textContent = c === col ? (dir === -1 ? ' ▼' : ' ▲') : '';
@@ -1258,9 +1236,52 @@ function sortPlayers(col) {
   renderPlayers();
 }
 
+async function togglePlayerDetail(name, btn) {
+  var tr = btn.closest('tr');
+  if (_openPlayerDetail === name) {
+    tr.nextSibling.remove();
+    _openPlayerDetail = null;
+    btn.textContent = 'Details';
+    return;
+  }
+  var prev = document.querySelector('#players-tbody .detail-row');
+  if (prev) {
+    prev.previousSibling.querySelector('.detail-btn').textContent = 'Details';
+    prev.remove();
+  }
+  _openPlayerDetail = name;
+  btn.textContent = 'Close';
+  var detailTr = document.createElement('tr');
+  detailTr.className = 'detail-row';
+  detailTr.innerHTML = '<td colspan="6"><div class="detail-wrap"><span style="color:#8b949e;font-size:.8rem">Loading…</span></div></td>';
+  tr.parentNode.insertBefore(detailTr, tr.nextSibling);
+  var data = await (await fetch('/api/stats/player/' + encodeURIComponent(name))).json();
+  if (data.error) {
+    detailTr.querySelector('.detail-wrap').innerHTML = '<span style="color:#f87171">' + esc(data.error) + '</span>';
+    return;
+  }
+  var wrap = detailTr.querySelector('.detail-wrap');
+  var statRow = document.createElement('div');
+  statRow.className = 'stat-row';
+  statRow.innerHTML = statBox(data.rounds_played, 'Rounds') + statBox(data.picks, 'Picks') +
+    statBox(data.wins, 'Wins', '#4ade80') + statBox(data.collisions, 'Collisions', '#f87171') +
+    statBox(pct(data.win_rate), 'Win Rate');
+  wrap.innerHTML = '';
+  wrap.appendChild(statRow);
+  var innerTbody = document.createElement('tbody');
+  personalRows(innerTbody, data.rows);
+  var innerTable = document.createElement('table');
+  innerTable.innerHTML = '<thead><tr><th>Rd</th><th>Item</th><th>Outcome</th><th class="td-right">Others</th><th class="td-right">Value</th></tr></thead>';
+  innerTable.appendChild(innerTbody);
+  wrap.appendChild(innerTable);
+}
+
 panelLoaders['players'] = async function() {
   _playersData = await (await fetch('/api/stats/players')).json();
   _playersSort = {col: 'wins', dir: -1};
+  _playerFilter = '';
+  var searchEl = document.getElementById('players-search');
+  if (searchEl) searchEl.value = '';
   renderPlayers();
 };
 
@@ -1269,15 +1290,26 @@ panelLoaders['players'] = async function() {
 // ---------------------------------------------------------------------------
 var _itemsData = [];
 var _itemsSort = {col: 'price', dir: -1};
+var _itemFilter = '';
+var _openItemDetail = null;
+
+function filterItems(val) {
+  _itemFilter = val.toLowerCase();
+  renderItems();
+}
 
 function renderItems() {
   var col = _itemsSort.col;
   var dir = _itemsSort.dir;
-  var sorted = _itemsData.slice().sort(function(a, b) {
+  var data = _itemFilter
+    ? _itemsData.filter(function(r) { return r.item.toLowerCase().includes(_itemFilter); })
+    : _itemsData;
+  var sorted = data.slice().sort(function(a, b) {
     var av = a[col], bv = b[col];
     if (typeof av === 'string') return dir * av.localeCompare(bv);
     return dir * (av - bv);
   });
+  _openItemDetail = null;
   var tbody = document.getElementById('items-list-tbody');
   tbody.innerHTML = '';
   sorted.forEach(function(r) {
@@ -1288,7 +1320,8 @@ function renderItems() {
       '<td class="td-right">' + r.appearances + '</td>' +
       '<td class="td-right">' + r.picked + '</td>' +
       '<td class="td-right">' + r.solo + '</td>' +
-      '<td class="td-right">' + (r.avg_pickers > 0 ? r.avg_pickers.toFixed(1) : '—') + '</td>';
+      '<td class="td-right">' + (r.avg_pickers > 0 ? r.avg_pickers.toFixed(1) : '—') + '</td>' +
+      '<td class="td-right"></td>';
 
     var nameInp = document.createElement('input');
     nameInp.className = 'editable-cell ec-name';
@@ -1313,6 +1346,13 @@ function renderItems() {
     priceInp.addEventListener('blur', function() { updateItemPrice(this); });
     tr.querySelector('.price-cell').appendChild(priceInp);
 
+    var btn = document.createElement('button');
+    btn.className = 'detail-btn';
+    btn.textContent = 'Details';
+    btn.dataset.item = r.item;
+    btn.addEventListener('click', function() { toggleItemDetail(this.dataset.item, this); });
+    tr.lastElementChild.appendChild(btn);
+
     tbody.appendChild(tr);
   });
 
@@ -1332,9 +1372,63 @@ function sortItems(col) {
   renderItems();
 }
 
+async function toggleItemDetail(itemName, btn) {
+  var tr = btn.closest('tr');
+  if (_openItemDetail === itemName) {
+    tr.nextSibling.remove();
+    _openItemDetail = null;
+    btn.textContent = 'Details';
+    return;
+  }
+  var prev = document.querySelector('#items-list-tbody .detail-row');
+  if (prev) {
+    prev.previousSibling.querySelector('.detail-btn').textContent = 'Details';
+    prev.remove();
+  }
+  _openItemDetail = itemName;
+  btn.textContent = 'Close';
+  var detailTr = document.createElement('tr');
+  detailTr.className = 'detail-row';
+  detailTr.innerHTML = '<td colspan="7"><div class="detail-wrap"><span style="color:#8b949e;font-size:.8rem">Loading…</span></div></td>';
+  tr.parentNode.insertBefore(detailTr, tr.nextSibling);
+  var data = await (await fetch('/api/stats/item/' + encodeURIComponent(itemName))).json();
+  if (data.error) {
+    detailTr.querySelector('.detail-wrap').innerHTML = '<span style="color:#f87171">' + esc(data.error) + '</span>';
+    return;
+  }
+  var wrap = detailTr.querySelector('.detail-wrap');
+  var statRow = document.createElement('div');
+  statRow.className = 'stat-row';
+  statRow.innerHTML = statBox(fmt(data.price), 'Price') + statBox(data.appearances, 'Appearances') +
+    statBox(data.picked, 'Times Picked') + statBox(data.skipped, 'Skipped', '#6b7280');
+  wrap.innerHTML = '';
+  wrap.appendChild(statRow);
+  var innerTbody = document.createElement('tbody');
+  if (!data.rows.length) {
+    innerTbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e;padding:.3rem .6rem">Nobody has picked this item.</td></tr>';
+  } else {
+    data.rows.forEach(function(r) {
+      var row = document.createElement('tr');
+      row.innerHTML = '<td>' + esc(r.player) + '</td>' +
+        '<td class="td-right">' + r.picks + '</td>' +
+        '<td class="td-right">' + r.wins + '</td>' +
+        '<td class="td-right">' + r.collisions + '</td>' +
+        '<td class="td-right">' + pct(r.pick_rate) + '</td>';
+      innerTbody.appendChild(row);
+    });
+  }
+  var innerTable = document.createElement('table');
+  innerTable.innerHTML = '<thead><tr><th>Player</th><th class="td-right">Picks</th><th class="td-right">Wins</th><th class="td-right">Collisions</th><th class="td-right">Pick Rate</th></tr></thead>';
+  innerTable.appendChild(innerTbody);
+  wrap.appendChild(innerTable);
+}
+
 panelLoaders['items-list'] = async function() {
   _itemsData = await (await fetch('/api/stats/items')).json();
   _itemsSort = {col: 'price', dir: -1};
+  _itemFilter = '';
+  var searchEl = document.getElementById('items-search');
+  if (searchEl) searchEl.value = '';
   renderItems();
 };
 
@@ -1360,94 +1454,6 @@ async function updateItemPrice(inp) {
   inp.value = fmt(price);
 }
 
-// ---------------------------------------------------------------------------
-// Search debounce (shared)
-// ---------------------------------------------------------------------------
-var _searchTimers = {};
-function debouncedSearch(type, val) {
-  clearTimeout(_searchTimers[type]);
-  var sugEl = document.getElementById(type + '-suggestions');
-  if (!val) { sugEl.classList.add('hidden'); return; }
-  _searchTimers[type] = setTimeout(async function() {
-    var url = '/api/stats/search/' + (type === 'player' ? 'players' : 'items') +
-              '?q=' + encodeURIComponent(val);
-    var names = await (await fetch(url)).json();
-    if (!names.length) { sugEl.classList.add('hidden'); return; }
-    sugEl.innerHTML = names.map(function(n) {
-      return '<button class="btn btn-secondary btn-sm" style="margin:.1rem" ' +
-        'data-name="' + esc(n) + '" onclick="selectSuggestion(\\'' + type + '\\', this.dataset.name)">' +
-        esc(n) + '</button>';
-    }).join('');
-    sugEl.classList.remove('hidden');
-  }, 250);
-}
-
-function selectSuggestion(type, name) {
-  document.getElementById(type + '-search-inp').value = name;
-  document.getElementById(type + '-suggestions').classList.add('hidden');
-  if (type === 'player') lookupPlayer();
-  else lookupItem();
-}
-
-// ---------------------------------------------------------------------------
-// Browse Players
-// ---------------------------------------------------------------------------
-async function lookupPlayer() {
-  var name = document.getElementById('player-search-inp').value.trim();
-  if (!name) return;
-  var data = await (await fetch('/api/stats/player/' + encodeURIComponent(name))).json();
-  var detailEl = document.getElementById('player-detail');
-  if (data.error) {
-    showMsg('player-detail-msg', esc(data.error), 'err');
-    detailEl.classList.add('hidden'); return;
-  }
-  clearMsg('player-detail-msg');
-  document.getElementById('player-stat-row').innerHTML =
-    statBox(data.rounds_played, 'Rounds') +
-    statBox(data.picks, 'Picks') +
-    statBox(data.wins, 'Wins', '#4ade80') +
-    statBox(data.collisions, 'Collisions', '#f87171') +
-    statBox(pct(data.win_rate), 'Win Rate');
-  personalRows(document.getElementById('player-detail-tbody'), data.rows);
-  detailEl.classList.remove('hidden');
-}
-
-// ---------------------------------------------------------------------------
-// Browse Items
-// ---------------------------------------------------------------------------
-async function lookupItem() {
-  var name = document.getElementById('item-search-inp').value.trim();
-  if (!name) return;
-  var data = await (await fetch('/api/stats/item/' + encodeURIComponent(name))).json();
-  var detailEl = document.getElementById('item-detail');
-  if (data.error) {
-    showMsg('item-detail-msg', esc(data.error), 'err');
-    detailEl.classList.add('hidden'); return;
-  }
-  clearMsg('item-detail-msg');
-  document.getElementById('item-stat-row').innerHTML =
-    statBox(fmt(data.price), 'Price') +
-    statBox(data.appearances, 'Appearances') +
-    statBox(data.picked, 'Times Picked') +
-    statBox(data.skipped, 'Skipped', '#6b7280');
-
-  var tbody = document.getElementById('item-detail-tbody');
-  tbody.innerHTML = '';
-  if (!data.rows.length) {
-    tbody.innerHTML = '<tr><td colspan="5" style="color:#8b949e;padding:.5rem .6rem">Nobody has picked this item.</td></tr>';
-  } else {
-    data.rows.forEach(function(r) {
-      var tr = document.createElement('tr');
-      tr.innerHTML = '<td>' + esc(r.player) + '</td>' +
-        '<td class="td-right">' + r.picks + '</td>' +
-        '<td class="td-right">' + r.wins + '</td>' +
-        '<td class="td-right">' + r.collisions + '</td>' +
-        '<td class="td-right">' + pct(r.pick_rate) + '</td>';
-      tbody.appendChild(tr);
-    });
-  }
-  detailEl.classList.remove('hidden');
-}
 
 // ---------------------------------------------------------------------------
 // My Stats
