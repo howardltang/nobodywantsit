@@ -99,6 +99,25 @@ def api_round_prices():
     return jsonify({"ok": True, "items": _pending["items"]})
 
 
+@app.route("/api/round/update_price", methods=["POST"])
+def api_round_update_price():
+    """Update an item's price mid-round (before results are saved)."""
+    data  = request.get_json()
+    item  = data.get("item", "").strip()
+    price = data.get("price")
+    if not item:
+        return jsonify({"error": "No item specified."}), 400
+    try:
+        price = float(str(price).replace(",", ""))
+        if price < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid price."}), 400
+    _state["item_values"][item] = price
+    save_state(_state)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/round/recommend", methods=["POST"])
 def api_round_recommend():
     if not _pending.get("items"):
@@ -164,12 +183,15 @@ def api_round_save():
         for item, players in new_round["items"].items() if len(players) == 1
     ]
 
-    _state["rounds"].append(new_round)
-    save_state(_state)
-    _retrain()
+    test_mode = bool(data.get("test_mode", False))
+    if not test_mode:
+        _state["rounds"].append(new_round)
+        save_state(_state)
+        _retrain()
     _pending.clear()
 
-    return jsonify({"ok": True, "winners": winners, "round_num": len(_state["rounds"])})
+    return jsonify({"ok": True, "winners": winners,
+                    "round_num": len(_state["rounds"]), "test_mode": test_mode})
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +235,48 @@ def api_stats_items():
         })
     rows.sort(key=lambda x: -x["price"])
     return jsonify(rows)
+
+
+@app.route("/api/items/update_price", methods=["POST"])
+def api_items_update_price():
+    data  = request.get_json()
+    item  = data.get("item", "").strip()
+    price = data.get("price")
+    if not item or item not in _state["item_values"]:
+        return jsonify({"error": "Item not found."}), 404
+    try:
+        price = float(str(price).replace(",", ""))
+        if price < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid price."}), 400
+    _state["item_values"][item] = price
+    save_state(_state)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/items/rename", methods=["POST"])
+def api_items_rename():
+    data     = request.get_json()
+    old_name = data.get("old_name", "").strip()
+    new_name = data.get("new_name", "").strip()
+    if not old_name or not new_name:
+        return jsonify({"error": "Both names required."}), 400
+    if old_name == new_name:
+        return jsonify({"ok": True})
+    if old_name not in _state["item_values"]:
+        return jsonify({"error": f"Item '{old_name}' not found."}), 404
+    canon_new = canonical_item(new_name, _state["item_values"])
+    if canon_new and canon_new != old_name:
+        return jsonify({"error": f"'{new_name}' already exists."}), 400
+    price = _state["item_values"].pop(old_name)
+    _state["item_values"][new_name] = price
+    for rd in _state["rounds"]:
+        if old_name in rd["items"]:
+            rd["items"][new_name] = rd["items"].pop(old_name)
+    save_state(_state)
+    _retrain()
+    return jsonify({"ok": True, "new_name": new_name})
 
 
 @app.route("/api/stats/player/<path:name>")
@@ -419,34 +483,45 @@ def api_settings_merge():
     if _state.get("my_player", "").lower() == old_lower:
         _state["my_player"] = to_canon
 
+    # Auto-record alias so future input of the old name maps to the canonical name
+    _state.setdefault("name_aliases", {})[from_canon.lower()] = to_canon
+
     save_state(_state)
     _retrain()
     return jsonify({"ok": True, "changed": changed, "from": from_canon, "to": to_canon})
 
 
-@app.route("/api/settings/alias/add", methods=["POST"])
-def api_settings_alias_add():
+@app.route("/api/items/merge", methods=["POST"])
+def api_items_merge():
     data      = request.get_json()
-    alias     = data.get("alias",     "").strip()
-    canonical = data.get("canonical", "").strip()
-    if not alias or not canonical:
-        return jsonify({"error": "Both fields required."}), 400
-    if alias.lower() == canonical.lower():
-        return jsonify({"error": "Alias and canonical name are the same."}), 400
-    _state.setdefault("name_aliases", {})[alias.lower()] = canonical
-    save_state(_state)
-    return jsonify({"ok": True})
+    from_name = data.get("from_name", "").strip()
+    to_name   = data.get("to_name",   "").strip()
 
+    from_canon = canonical_item(from_name, _state["item_values"])
+    to_canon   = canonical_item(to_name,   _state["item_values"])
+    if not from_canon:
+        return jsonify({"error": f"Item '{from_name}' not found."}), 400
+    if not to_canon:
+        return jsonify({"error": f"Item '{to_name}' not found."}), 400
+    if from_canon.lower() == to_canon.lower():
+        return jsonify({"error": "Same item — nothing to merge."}), 400
 
-@app.route("/api/settings/alias/remove", methods=["POST"])
-def api_settings_alias_remove():
-    alias   = request.get_json().get("alias", "").strip().lower()
-    aliases = _state.get("name_aliases", {})
-    if alias not in aliases:
-        return jsonify({"error": f"Alias '{alias}' not found."}), 400
-    del aliases[alias]
+    del _state["item_values"][from_canon]
+    changed = 0
+    for rd in _state["rounds"]:
+        if from_canon in rd["items"]:
+            pickers = rd["items"].pop(from_canon)
+            if to_canon not in rd["items"]:
+                rd["items"][to_canon] = pickers
+            else:
+                # Both items appeared in the same round — combine picker lists
+                merged = list({p for p in rd["items"][to_canon] + pickers})
+                rd["items"][to_canon] = merged
+            changed += 1
+
     save_state(_state)
-    return jsonify({"ok": True})
+    _retrain()
+    return jsonify({"ok": True, "changed": changed, "from": from_canon, "to": to_canon})
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +621,31 @@ MAIN_HTML = """<!DOCTYPE html>
     tbody tr:hover td { background: #21262d; }
     .td-right { text-align: right; }
     .td-mono  { font-family: monospace; }
+    .sortable { cursor: pointer; user-select: none; }
+    .sortable:hover { color: #c9d1d9; }
+    .sort-ind { margin-left: .3rem; font-size: .7rem; opacity: .6; }
+    .price-inp { width: 90px; background: #161b22; border: 1px solid #30363d; color: #c9d1d9;
+                 border-radius: 3px; padding: 1px 4px; font-family: monospace; font-size: .8rem;
+                 text-align: right; }
+    .price-inp:focus { border-color: #388bfd; outline: none; }
+    td:has(> .editable-cell) { padding: 0; }
+    .editable-cell { background: transparent; border: 1px solid transparent; color: #c9d1d9;
+                     border-radius: 3px; padding: 3px 6px; font-size: .8rem; cursor: pointer;
+                     font-family: inherit; }
+    .editable-cell:hover { border-color: #30363d; }
+    .editable-cell:focus { background: #161b22; border-color: #388bfd; outline: none; cursor: text; }
+    .editable-cell.ec-name  { width: 100%; box-sizing: border-box; min-width: 0;
+                               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .editable-cell.ec-name:focus { white-space: normal; overflow: visible; }
+    .editable-cell.ec-price { text-align: right; font-family: monospace; width: 120px; }
+    .toggle-wrap { display:flex; align-items:center; gap:.45rem; font-size:.8rem; color:#8b949e; cursor:pointer; }
+    .toggle-wrap input { display:none; }
+    .toggle-track { width:34px; height:18px; background:#30363d; border-radius:9px; position:relative;
+                    transition:background .2s; flex-shrink:0; }
+    .toggle-track::after { content:''; position:absolute; top:3px; left:3px; width:12px; height:12px;
+                           background:#8b949e; border-radius:50%; transition:transform .2s, background .2s; }
+    .toggle-wrap input:checked + .toggle-track { background:#b45309; }
+    .toggle-wrap input:checked + .toggle-track::after { transform:translateX(16px); background:#f0883e; }
 
     /* Recommendation table */
     .rec-top td     { color: #fbbf24; }
@@ -583,10 +683,6 @@ MAIN_HTML = """<!DOCTYPE html>
     .settings-sep { font-size: .75rem; color: #484f58; text-transform: uppercase;
                     letter-spacing: .05em; border-bottom: 1px solid #30363d;
                     padding-bottom: .3rem; margin: 1rem 0 .6rem; }
-    .alias-row { display: flex; align-items: center; gap: .4rem; padding: .2rem .4rem;
-                 background: #0d1117; border-radius: 3px; margin-bottom: .3rem; font-size: .82rem; }
-    .alias-arrow { color: #58a6ff; }
-    .alias-name  { flex: 1; }
   </style>
 </head>
 <body>
@@ -604,7 +700,7 @@ MAIN_HTML = """<!DOCTYPE html>
     <button class="nav-btn active" onclick="showPanel('round', this)">▶ Play a Round</button>
     <div class="nav-section">Statistics</div>
     <button class="nav-btn" onclick="showPanel('players', this)">Player Leaderboard</button>
-    <button class="nav-btn" onclick="showPanel('items-list', this)">Item Prices</button>
+    <button class="nav-btn" onclick="showPanel('items-list', this)">Item List</button>
     <button class="nav-btn" onclick="showPanel('browse-players', this)">Browse Players</button>
     <button class="nav-btn" onclick="showPanel('browse-items', this)">Browse Items</button>
     <div class="nav-section">Personal</div>
@@ -621,7 +717,14 @@ MAIN_HTML = """<!DOCTYPE html>
 
       <!-- Step 1: Setup -->
       <div class="card" id="step-setup">
-        <h6>Play a Round</h6>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.6rem">
+          <h6 style="margin:0">Play a Round</h6>
+          <label class="toggle-wrap">
+            <input type="checkbox" id="chk-test-mode">
+            <span class="toggle-track"></span>
+            Test mode
+          </label>
+        </div>
         <div class="field">
           <label>Participants (comma-separated)</label>
           <input type="text" id="inp-participants" placeholder="Alice, Bob, Carol...">
@@ -690,7 +793,7 @@ MAIN_HTML = """<!DOCTYPE html>
 
       <!-- Step 4: Winners -->
       <div class="card hidden" id="step-winners">
-        <h6>Round Saved!</h6>
+        <h6 id="winners-heading">Round Saved!</h6>
         <div id="winners-display"></div>
         <div class="btn-group" style="margin-top:.75rem">
           <button class="btn btn-primary" onclick="resetRound()">Play Another Round</button>
@@ -705,9 +808,11 @@ MAIN_HTML = """<!DOCTYPE html>
         <div class="tbl-wrap">
           <table>
             <thead><tr>
-              <th>Player</th>
-              <th class="td-right">Picks</th><th class="td-right">Wins</th>
-              <th class="td-right">Win%</th><th class="td-right">Contrarian</th>
+              <th class="sortable" onclick="sortPlayers('name')">Player<span class="sort-ind" id="psort-name"></span></th>
+              <th class="td-right sortable" onclick="sortPlayers('picks')">Picks<span class="sort-ind" id="psort-picks"></span></th>
+              <th class="td-right sortable" onclick="sortPlayers('wins')">Wins<span class="sort-ind" id="psort-wins"> ▼</span></th>
+              <th class="td-right sortable" onclick="sortPlayers('win_rate')">Win%<span class="sort-ind" id="psort-win_rate"></span></th>
+              <th class="td-right sortable" onclick="sortPlayers('contrarian')">Contrarian<span class="sort-ind" id="psort-contrarian"></span></th>
             </tr></thead>
             <tbody id="players-tbody"></tbody>
           </table>
@@ -715,17 +820,20 @@ MAIN_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- ─── ITEM PRICES ─── -->
+    <!-- ─── ITEM LIST ─── -->
     <div class="panel" id="panel-items-list">
       <div class="card">
-        <h6>Item Prices</h6>
+        <h6>Item List</h6>
+        <div id="items-list-msg"></div>
         <div class="tbl-wrap">
           <table>
             <thead><tr>
-              <th>Item</th>
-              <th class="td-right">Price</th><th class="td-right">App.</th>
-              <th class="td-right">Picked</th><th class="td-right">Solo</th>
-              <th class="td-right">Avg Pickers</th>
+              <th style="max-width:200px" class="sortable" onclick="sortItems('item')">Item<span class="sort-ind" id="isort-item"></span></th>
+              <th class="td-right sortable" onclick="sortItems('price')">Price<span class="sort-ind" id="isort-price"> ▼</span></th>
+              <th class="td-right sortable" onclick="sortItems('appearances')">App.<span class="sort-ind" id="isort-appearances"></span></th>
+              <th class="td-right sortable" onclick="sortItems('picked')">Picked<span class="sort-ind" id="isort-picked"></span></th>
+              <th class="td-right sortable" onclick="sortItems('solo')">Solo<span class="sort-ind" id="isort-solo"></span></th>
+              <th class="td-right sortable" onclick="sortItems('avg_pickers')">Avg Pickers<span class="sort-ind" id="isort-avg_pickers"></span></th>
             </tr></thead>
             <tbody id="items-list-tbody"></tbody>
           </table>
@@ -840,6 +948,7 @@ MAIN_HTML = """<!DOCTYPE html>
         <button class="btn btn-primary btn-sm" onclick="saveDecay()">Save &amp; Retrain</button>
 
         <div class="settings-sep">Merge Player Names</div>
+        <div class="card-sub" style="margin-bottom:.5rem">Rewrites all historical round data and records an automatic alias so the old name maps to the new one in future rounds.</div>
         <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.6rem">
           <div class="field" style="flex:1;min-width:120px;margin-bottom:0">
             <label>Merge FROM (name to remove)</label>
@@ -853,20 +962,20 @@ MAIN_HTML = """<!DOCTYPE html>
         </div>
         <button class="btn btn-danger btn-sm" onclick="mergePlayers()">Merge</button>
 
-        <div class="settings-sep">Name Aliases</div>
-        <div id="alias-list" style="margin-bottom:.6rem"></div>
-        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
-          <div class="field" style="flex:1;min-width:100px;margin-bottom:0">
-            <label>Alias (auto-replaced on input)</label>
-            <input type="text" id="inp-alias" placeholder="Neuv">
+        <div class="settings-sep">Merge Items</div>
+        <div class="card-sub" style="margin-bottom:.5rem">Combines two items into one, rewriting all historical round data. The merged item is removed from the item list.</div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.6rem">
+          <div class="field" style="flex:1;min-width:120px;margin-bottom:0">
+            <label>Merge FROM (item to remove)</label>
+            <input type="text" id="inp-item-merge-from" placeholder="Old item name">
           </div>
           <div style="color:#8b949e;padding-bottom:.4rem">→</div>
-          <div class="field" style="flex:1;min-width:100px;margin-bottom:0">
-            <label>Canonical name</label>
-            <input type="text" id="inp-alias-canon" placeholder="Neuvillette">
+          <div class="field" style="flex:1;min-width:120px;margin-bottom:0">
+            <label>Merge INTO (item to keep)</label>
+            <input type="text" id="inp-item-merge-into" placeholder="Canonical item name">
           </div>
         </div>
-        <button class="btn btn-primary btn-sm" style="margin-top:.5rem" onclick="addAlias()">Add Alias</button>
+        <button class="btn btn-danger btn-sm" onclick="mergeItems()">Merge</button>
       </div>
     </div>
 
@@ -913,7 +1022,7 @@ function personalRows(tbody, rows) {
 }
 
 function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,10 +1144,18 @@ async function getRecommendation() {
     tr.innerHTML =
       '<td>' + r.rank + star + '</td>' +
       '<td>' + esc(r.item) + youTag + '</td>' +
-      '<td class="td-right td-mono">' + fmt(r.value) + '</td>' +
+      '<td class="td-right td-mono price-cell"></td>' +
       '<td class="td-right td-mono ' + psClass + '">' + pct(r.p_solo) + '</td>' +
       '<td class="td-right td-mono">' + evStr + '</td>' +
       '<td style="color:#8b949e;font-size:.75rem">' + esc(r.history) + '</td>';
+    var priceInp = document.createElement('input');
+    priceInp.className = 'price-inp';
+    priceInp.value = r.value;
+    priceInp.dataset.item = r.item;
+    priceInp.dataset.orig = r.value;
+    priceInp.addEventListener('blur', function() { updatePrice(this); });
+    priceInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') this.blur(); });
+    tr.querySelector('.price-cell').appendChild(priceInp);
     tbody.appendChild(tr);
   });
 
@@ -1047,7 +1164,18 @@ async function getRecommendation() {
   document.getElementById('rec-output').classList.remove('hidden');
 }
 
+async function updatePrice(inp) {
+  var raw   = inp.value.replace(/,/g, '').trim();
+  var price = parseFloat(raw);
+  if (isNaN(price) || price < 0) { inp.value = inp.dataset.orig; return; }
+  if (price === parseFloat(inp.dataset.orig)) return;  // unchanged
+  var data = await post('/api/round/update_price', {item: inp.dataset.item, price: price});
+  if (data.error) { showMsg('round-msg', esc(data.error), 'err'); inp.value = inp.dataset.orig; return; }
+  getRecommendation();  // refresh rankings with new price
+}
+
 async function saveRound() {
+  var testMode = document.getElementById('chk-test-mode').checked;
   var results = [];
   document.querySelectorAll('.result-row').forEach(function(row) {
     var val = row.querySelector('.result-players').value.trim();
@@ -1057,25 +1185,31 @@ async function saveRound() {
     }
   });
 
-  var data = await post('/api/round/save', {results: results});
+  var data = await post('/api/round/save', {results: results, test_mode: testMode});
   if (data.error) { showMsg('round-msg', esc(data.error), 'err'); return; }
 
+  document.getElementById('winners-heading').textContent =
+    testMode ? 'Test Round Complete (not saved)' : 'Round Saved!';
+
   var display = document.getElementById('winners-display');
+  var prefix = testMode ? '<div class="card-sub" style="color:#f0883e;margin-bottom:.5rem">Test mode — this round was not recorded.</div>' : '';
   if (!data.winners.length) {
-    display.innerHTML = '<div class="card-sub">No solo winners this round.</div>';
+    display.innerHTML = prefix + '<div class="card-sub">No solo winners this round.</div>';
   } else {
-    display.innerHTML = data.winners.map(function(w) {
+    display.innerHTML = prefix + data.winners.map(function(w) {
       return '<div class="winner-row">🏆 <strong>' + esc(w.player) +
         '</strong> won <strong>' + esc(w.item) + '</strong>' +
         '<span class="winner-val">' + fmt(w.value) + ' meat</span></div>';
     }).join('');
   }
 
-  // Update topbar
-  var info = document.getElementById('topbar-info');
-  var mp = info.textContent.indexOf('·');
-  var suffix = mp !== -1 ? ' ' + info.textContent.substring(mp) : '';
-  info.textContent = data.round_num + ' round' + (data.round_num !== 1 ? 's' : '') + suffix;
+  // Only update topbar round count when actually saved
+  if (!testMode) {
+    var info = document.getElementById('topbar-info');
+    var mp = info.textContent.indexOf('·');
+    var suffix = mp !== -1 ? ' ' + info.textContent.substring(mp) : '';
+    info.textContent = data.round_num + ' round' + (data.round_num !== 1 ? 's' : '') + suffix;
+  }
 
   document.getElementById('step-recommend').classList.add('hidden');
   document.getElementById('step-results').classList.add('hidden');
@@ -1083,13 +1217,22 @@ async function saveRound() {
 }
 
 // ---------------------------------------------------------------------------
-// Player Leaderboard
+// Player Leaderboard (sortable)
 // ---------------------------------------------------------------------------
-panelLoaders['players'] = async function() {
-  var rows = await (await fetch('/api/stats/players')).json();
+var _playersData = [];
+var _playersSort = {col: 'wins', dir: -1};
+
+function renderPlayers() {
+  var col = _playersSort.col;
+  var dir = _playersSort.dir;
+  var sorted = _playersData.slice().sort(function(a, b) {
+    var av = a[col], bv = b[col];
+    if (typeof av === 'string') return dir * av.localeCompare(bv);
+    return dir * (av - bv);
+  });
   var tbody = document.getElementById('players-tbody');
   tbody.innerHTML = '';
-  rows.forEach(function(r) {
+  sorted.forEach(function(r) {
     var tr = document.createElement('tr');
     tr.innerHTML = '<td>' + esc(r.name) + '</td>' +
       '<td class="td-right">' + r.picks + '</td>' +
@@ -1098,26 +1241,124 @@ panelLoaders['players'] = async function() {
       '<td class="td-right">' + r.contrarian.toFixed(2) + '</td>';
     tbody.appendChild(tr);
   });
+  // Update sort indicators
+  ['name','picks','wins','win_rate','contrarian'].forEach(function(c) {
+    var el = document.getElementById('psort-' + c);
+    if (el) el.textContent = c === col ? (dir === -1 ? ' ▼' : ' ▲') : '';
+  });
+}
+
+function sortPlayers(col) {
+  if (_playersSort.col === col) {
+    _playersSort.dir *= -1;
+  } else {
+    _playersSort.col = col;
+    _playersSort.dir = col === 'name' ? 1 : -1;
+  }
+  renderPlayers();
+}
+
+panelLoaders['players'] = async function() {
+  _playersData = await (await fetch('/api/stats/players')).json();
+  _playersSort = {col: 'wins', dir: -1};
+  renderPlayers();
 };
 
 // ---------------------------------------------------------------------------
-// Item Prices
+// Item List
 // ---------------------------------------------------------------------------
-panelLoaders['items-list'] = async function() {
-  var rows = await (await fetch('/api/stats/items')).json();
+var _itemsData = [];
+var _itemsSort = {col: 'price', dir: -1};
+
+function renderItems() {
+  var col = _itemsSort.col;
+  var dir = _itemsSort.dir;
+  var sorted = _itemsData.slice().sort(function(a, b) {
+    var av = a[col], bv = b[col];
+    if (typeof av === 'string') return dir * av.localeCompare(bv);
+    return dir * (av - bv);
+  });
   var tbody = document.getElementById('items-list-tbody');
   tbody.innerHTML = '';
-  rows.forEach(function(r) {
+  sorted.forEach(function(r) {
     var tr = document.createElement('tr');
-    tr.innerHTML = '<td>' + esc(r.item) + '</td>' +
-      '<td class="td-right td-mono">' + fmt(r.price) + '</td>' +
+    tr.innerHTML =
+      '<td class="item-name-cell"></td>' +
+      '<td class="td-right td-mono price-cell"></td>' +
       '<td class="td-right">' + r.appearances + '</td>' +
       '<td class="td-right">' + r.picked + '</td>' +
       '<td class="td-right">' + r.solo + '</td>' +
       '<td class="td-right">' + (r.avg_pickers > 0 ? r.avg_pickers.toFixed(1) : '—') + '</td>';
+
+    var nameInp = document.createElement('input');
+    nameInp.className = 'editable-cell ec-name';
+    nameInp.value = r.item;
+    nameInp.dataset.orig = r.item;
+    nameInp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') this.blur();
+      else if (e.key === 'Escape') { this.value = this.dataset.orig; this.blur(); }
+    });
+    nameInp.addEventListener('blur', function() { renameItem(this); });
+    tr.querySelector('.item-name-cell').appendChild(nameInp);
+
+    var priceInp = document.createElement('input');
+    priceInp.className = 'editable-cell ec-price';
+    priceInp.value = fmt(r.price);
+    priceInp.dataset.item = r.item;
+    priceInp.dataset.orig = r.price;
+    priceInp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') this.blur();
+      else if (e.key === 'Escape') { this.value = fmt(parseFloat(this.dataset.orig)); this.blur(); }
+    });
+    priceInp.addEventListener('blur', function() { updateItemPrice(this); });
+    tr.querySelector('.price-cell').appendChild(priceInp);
+
     tbody.appendChild(tr);
   });
+
+  ['item','price','appearances','picked','solo','avg_pickers'].forEach(function(c) {
+    var el = document.getElementById('isort-' + c);
+    if (el) el.textContent = c === col ? (dir === -1 ? ' ▼' : ' ▲') : '';
+  });
+}
+
+function sortItems(col) {
+  if (_itemsSort.col === col) {
+    _itemsSort.dir *= -1;
+  } else {
+    _itemsSort.col = col;
+    _itemsSort.dir = col === 'item' ? 1 : -1;
+  }
+  renderItems();
+}
+
+panelLoaders['items-list'] = async function() {
+  _itemsData = await (await fetch('/api/stats/items')).json();
+  _itemsSort = {col: 'price', dir: -1};
+  renderItems();
 };
+
+async function renameItem(inp) {
+  var newName = inp.value.trim();
+  var oldName = inp.dataset.orig;
+  if (!newName || newName === oldName) { inp.value = oldName; return; }
+  var data = await post('/api/items/rename', {old_name: oldName, new_name: newName});
+  if (data.error) { showMsg('items-list-msg', esc(data.error), 'err'); inp.value = oldName; return; }
+  clearMsg('items-list-msg');
+  panelLoaders['items-list']();
+}
+
+async function updateItemPrice(inp) {
+  var raw   = inp.value.replace(/,/g, '').trim();
+  var price = parseFloat(raw);
+  if (isNaN(price) || price < 0) { inp.value = fmt(parseFloat(inp.dataset.orig)); return; }
+  if (price === parseFloat(inp.dataset.orig)) { inp.value = fmt(price); return; }
+  var data = await post('/api/items/update_price', {item: inp.dataset.item, price: price});
+  if (data.error) { showMsg('items-list-msg', esc(data.error), 'err'); inp.value = fmt(parseFloat(inp.dataset.orig)); return; }
+  clearMsg('items-list-msg');
+  inp.dataset.orig = price;
+  inp.value = fmt(price);
+}
 
 // ---------------------------------------------------------------------------
 // Search debounce (shared)
@@ -1239,21 +1480,6 @@ panelLoaders['settings'] = async function() {
   document.getElementById('sel-utility').value   = data.utility_mode || 'linear';
   document.getElementById('inp-decay').value     = data.decay_factor || 0.8;
 
-  var aliases = data.aliases || {};
-  var aliasList = document.getElementById('alias-list');
-  var keys = Object.keys(aliases);
-  if (!keys.length) {
-    aliasList.innerHTML = '<div style="color:#8b949e;font-size:.8rem">(no aliases defined)</div>';
-  } else {
-    aliasList.innerHTML = keys.map(function(alias) {
-      return '<div class="alias-row">' +
-        '<span class="alias-name">&#39;' + esc(alias) + '&#39;</span>' +
-        '<span class="alias-arrow">→</span>' +
-        '<span class="alias-name">&#39;' + esc(aliases[alias]) + '&#39;</span>' +
-        '<button class="btn btn-danger btn-sm" data-alias="' + esc(alias) +
-        '" onclick="removeAlias(this.dataset.alias)">Remove</button></div>';
-    }).join('');
-  }
 };
 
 async function savePlayerName() {
@@ -1287,7 +1513,7 @@ async function mergePlayers() {
   if (!from_name || !to_name) {
     showMsg('settings-msg', 'Both names required.', 'err'); return;
   }
-  if (!confirm("Merge '" + from_name + "' → '" + to_name + "'?\\nThis rewrites all historical round data.")) return;
+  if (!confirm("Merge '" + from_name + "' → '" + to_name + "'?\\nThis rewrites all historical round data and records an alias so the old name is recognised automatically in future.")) return;
   var data = await post('/api/settings/merge', {from_name: from_name, to_name: to_name});
   if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
   showMsg('settings-msg', "Merged '" + esc(data.from) + "' → '" + esc(data.to) +
@@ -1296,25 +1522,19 @@ async function mergePlayers() {
   document.getElementById('inp-merge-into').value = '';
 }
 
-async function addAlias() {
-  var alias     = document.getElementById('inp-alias').value.trim();
-  var canonical = document.getElementById('inp-alias-canon').value.trim();
-  if (!alias || !canonical) {
+async function mergeItems() {
+  var from_name = document.getElementById('inp-item-merge-from').value.trim();
+  var to_name   = document.getElementById('inp-item-merge-into').value.trim();
+  if (!from_name || !to_name) {
     showMsg('settings-msg', 'Both fields required.', 'err'); return;
   }
-  var data = await post('/api/settings/alias/add', {alias: alias, canonical: canonical});
+  if (!confirm("Merge '" + from_name + "' → '" + to_name + "'?\\nThis rewrites all historical round data and removes the first item.")) return;
+  var data = await post('/api/items/merge', {from_name: from_name, to_name: to_name});
   if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
-  showMsg('settings-msg', "Alias '" + esc(alias) + "' → '" + esc(canonical) + "' added.");
-  document.getElementById('inp-alias').value       = '';
-  document.getElementById('inp-alias-canon').value = '';
-  panelLoaders['settings']();
-}
-
-async function removeAlias(alias) {
-  var data = await post('/api/settings/alias/remove', {alias: alias});
-  if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
-  showMsg('settings-msg', "Alias '" + esc(alias) + "' removed.");
-  panelLoaders['settings']();
+  showMsg('settings-msg', "Merged '" + esc(data.from) + "' → '" + esc(data.to) +
+    "'. " + data.changed + " round(s) updated.");
+  document.getElementById('inp-item-merge-from').value = '';
+  document.getElementById('inp-item-merge-into').value = '';
 }
 </script>
 </body>
