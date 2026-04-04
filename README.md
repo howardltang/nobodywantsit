@@ -1,6 +1,6 @@
 # Nobody Wants It — Pick Advisor
 
-A command-line advisor for the game *Nobody Wants It*, where players secretly pick items from a shared list and only win an item if they picked it alone. The tool learns from every round you enter and estimates which item gives you the best chance of a solo win.
+A command-line and web advisor for the game *Nobody Wants It*, where players secretly pick items from a shared list and only win an item if they picked it alone. The tool learns from every round you enter and estimates which item gives you the best chance of a solo win.
 
 ---
 
@@ -56,6 +56,49 @@ All data is saved automatically to `nwi_state.json` in the same directory. The f
 
 ---
 
+## Web UI
+
+The web UI runs on `http://localhost:5001` and provides the following pages via the sidebar:
+
+### Play a Round
+
+Steps through the round wizard:
+
+1. **Enter participants and items** — participants as a comma-separated list; items one per line
+2. **Set prices** — any item not seen before prompts for a price; typing an existing item name merges a typo with its canonical entry
+3. **Recommendation** — ranked table of all items by EV; item prices are editable inline and rankings refresh automatically
+4. **Enter results** — fill in who picked each item; leave blank for skipped items
+5. **Winners** — solo winners are displayed; round is saved to history
+
+A **Test mode** toggle in the round header runs through the full flow without saving any data.
+
+### Player Leaderboard
+
+Sortable table of all players showing picks, wins, win rate, and contrarian score. A filter bar narrows the list by name. Click **Details** on any row to expand an inline view of that player's round-by-round pick history.
+
+### Item List
+
+Sortable table of all known items. A filter bar narrows the list by name. Click **Details** on any row to expand an inline view of per-player pick stats for that item.
+
+- **Item names** are editable inline (click to edit, Enter to save, Escape to cancel)
+- **Prices** are editable inline with the same controls; prices display with thousand separators
+
+### My Stats
+
+Shows your personal round-by-round pick history — items picked, outcome, number of other pickers, and item value. Your player name must be set in Settings.
+
+### Settings
+
+| Setting | Description |
+|---------|-------------|
+| My Player Name | Records which player in the results is you. Enables personal annotations in the recommendation table. |
+| Utility Mode | Scoring function used for recommendations. See Utility modes below. |
+| Recency Decay Factor | Controls how much weight older rounds carry. `0.8` (default) = a round five sessions ago counts ~33% as much as the latest. `1.0` = all rounds weighted equally. |
+| Merge Player Names | Rewrites all historical occurrences of one player name to another. Automatically records an alias so the old name maps to the new one in future rounds. |
+| Merge Items | Combines two items into one, rewriting all historical round data. The source item is removed from the item list. |
+
+---
+
 ## Menu structure (CLI)
 
 ```
@@ -79,16 +122,6 @@ All data is saved automatically to `nwi_state.json` in the same directory. The f
 
 ---
 
-## Playing a round
-
-1. **Enter participants** — comma-separated list of player names for this round
-2. **Enter items** — one per line, blank line to finish
-3. **Set prices** — any item not seen before will prompt for a price; you can also type an existing item name to merge a typo with its canonical entry
-4. **Get a recommendation** — optional ranked table of all items by EV, with your personal history on each item annotated
-5. **Enter results** — format is `item: player1, player2, ...`; only enter items that were actually picked; items left out are recorded as skipped (which is itself useful data)
-
----
-
 ## Recommendation table
 
 ```
@@ -99,7 +132,7 @@ All data is saved automatically to `nwi_state.json` in the same directory. The f
 ★ = top pick by EV  |  EV = price × P(solo)  |  YOU: W=won, C=collision
 ```
 
-The `[YOU: ...]` annotation appears on any item you have personally picked before, showing your win/collision record on that specific item.
+The `[YOU: ...]` annotation appears on any item you have previously picked, showing your win/collision record on that specific item.
 
 ### Utility modes
 
@@ -131,25 +164,9 @@ This means the model correctly assigns high P(solo) to consistently ignored item
 
 ## Player tracking
 
-The **player leaderboard** (Statistics → Player leaderboard) shows win rate and a contrarian score for any player with three or more picks. The contrarian score reflects how often a player avoids the items that others crowd onto.
+The **Player Leaderboard** shows wins, win rate, and a contrarian score for all players. The contrarian score reflects how often a player avoids the items that others crowd onto. Click **Details** on any row to see that player's full round-by-round pick history.
 
-**Browse player stats** lets you look up any player by name (partial matching supported) and see their full pick history round by round — items picked, outcome, number of other pickers, and item value.
-
-**My stats** shows the same view for your own player name, which can be set in Settings.
-
----
-
-## Settings
-
-**Set my player name** — records which player in the results is you. Once set, the recommendation table annotates items you have previously picked with your personal win/collision record.
-
-**Merge player names** — if the same person appears under multiple names across different rounds (e.g. a nickname vs a full name), this option rewrites all historical occurrences of one name to another. Partial name matching is supported. A confirmation prompt shows how many occurrences will be affected before any changes are made.
-
-**Manage name aliases** — define persistent shorthand substitutions applied automatically when entering player names (e.g. `neuv` → `Neuvillette`). Aliases are stored in the state file and applied on every round.
-
-**Recency decay factor** — controls how much weight older rounds carry relative to recent ones. `0.8` (default) means a round five sessions ago counts ~33% as much as the latest. `1.0` disables decay and weights all rounds equally.
-
-**Utility mode** — sets the scoring function used for recommendations. See the Utility modes section above.
+**My Stats** shows the same view for your own player name, which can be set in Settings.
 
 ---
 
@@ -160,7 +177,7 @@ All data lives in `nwi_state.json`. It contains:
 - `rounds` — list of rounds, each with an `items` dict mapping item names to lists of players who picked them (empty list = nobody picked it that round)
 - `item_values` — dict of item name → price
 - `my_player` — your player name, if set
-- `name_aliases` — dict of `{alias_lowercase: canonical_name}`
+- `name_aliases` — dict of `{alias_lowercase: canonical_name}` (managed automatically by player merges)
 - `decay_factor` — recency decay weight (default `0.8`)
 - `utility_mode` — scoring function for recommendations (`linear`, `sqrt`, or `log`)
 

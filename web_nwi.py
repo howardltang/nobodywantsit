@@ -1439,7 +1439,11 @@ async function renameItem(inp) {
   var data = await post('/api/items/rename', {old_name: oldName, new_name: newName});
   if (data.error) { showMsg('items-list-msg', esc(data.error), 'err'); inp.value = oldName; return; }
   clearMsg('items-list-msg');
-  panelLoaders['items-list']();
+  var row = _itemsData.find(function(r) { return r.item === oldName; });
+  if (row) row.item = data.new_name;
+  inp.dataset.orig = data.new_name;
+  var priceInp = inp.closest('tr').querySelector('.ec-price');
+  if (priceInp) priceInp.dataset.item = data.new_name;
 }
 
 async function updateItemPrice(inp) {
@@ -1452,6 +1456,8 @@ async function updateItemPrice(inp) {
   clearMsg('items-list-msg');
   inp.dataset.orig = price;
   inp.value = fmt(price);
+  var row = _itemsData.find(function(r) { return r.item === inp.dataset.item; });
+  if (row) row.price = price;
 }
 
 
