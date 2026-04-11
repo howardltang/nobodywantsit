@@ -464,14 +464,15 @@ def api_settings_merge():
     to_name   = data.get("to_name",   "").strip()
 
     from_canon = canonical_player(from_name, _player_profiles)
-    to_canon   = canonical_player(to_name,   _player_profiles)
+    to_canon   = to_name  # use the exact capitalisation the user typed for the target
     if not from_canon:
         return jsonify({"error": f"Player '{from_name}' not found."}), 400
     if not to_canon:
-        return jsonify({"error": f"Player '{to_name}' not found."}), 400
-    if from_canon.lower() == to_canon.lower():
-        return jsonify({"error": "Same player — nothing to merge."}), 400
+        return jsonify({"error": "Target name is empty."}), 400
 
+    same_spelling = from_canon.lower() == to_canon.lower()
+
+    # Recapitalise all historical occurrences
     old_lower = from_canon.lower()
     changed = 0
     for rd in _state["rounds"]:
@@ -483,12 +484,33 @@ def api_settings_merge():
     if _state.get("my_player", "").lower() == old_lower:
         _state["my_player"] = to_canon
 
-    # Auto-record alias so future input of the old name maps to the canonical name
-    _state.setdefault("name_aliases", {})[from_canon.lower()] = to_canon
+    aliases = _state.setdefault("name_aliases", {})
+    # Update any existing aliases that point to the old capitalisation
+    for key in list(aliases.keys()):
+        if aliases[key].lower() == old_lower:
+            aliases[key] = to_canon
+
+    if same_spelling:
+        # Pure recapitalisation — no alias needed (the normalised key is identical)
+        pass
+    else:
+        # Different names — record alias so old name is auto-replaced in future input
+        aliases[from_canon.lower()] = to_canon
 
     save_state(_state)
     _retrain()
     return jsonify({"ok": True, "changed": changed, "from": from_canon, "to": to_canon})
+
+
+@app.route("/api/settings/alias/remove", methods=["POST"])
+def api_settings_alias_remove():
+    alias   = request.get_json().get("alias", "").strip().lower()
+    aliases = _state.get("name_aliases", {})
+    if alias not in aliases:
+        return jsonify({"error": "Alias not found."}), 400
+    del aliases[alias]
+    save_state(_state)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/items/merge", methods=["POST"])
@@ -638,6 +660,10 @@ MAIN_HTML = """<!DOCTYPE html>
                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .editable-cell.ec-name:focus { white-space: normal; overflow: visible; }
     .editable-cell.ec-price { text-align: right; font-family: monospace; width: 120px; }
+    .alias-row { display:flex; align-items:center; gap:.5rem; padding:.25rem .4rem;
+                 background:#0d1117; border-radius:3px; margin-bottom:.3rem; font-size:.82rem; }
+    .alias-name { flex:1; color:#c9d1d9; }
+    .alias-arrow { color:#58a6ff; }
     .toggle-wrap { display:flex; align-items:center; gap:.45rem; font-size:.8rem; color:#8b949e; cursor:pointer; }
     .toggle-wrap input { display:none; }
     .toggle-track { width:34px; height:18px; background:#30363d; border-radius:9px; position:relative;
@@ -922,6 +948,10 @@ MAIN_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" onclick="mergePlayers()">Merge</button>
+        <details style="margin-top:.75rem">
+          <summary style="cursor:pointer;color:#58a6ff;font-size:.8rem;user-select:none">Current aliases</summary>
+          <div id="alias-list" style="margin-top:.5rem"></div>
+        </details>
 
         <div class="settings-sep">Merge Items</div>
         <div class="card-sub" style="margin-bottom:.5rem">Combines two items into one, rewriting all historical round data. The merged item is removed from the item list.</div>
@@ -937,6 +967,7 @@ MAIN_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <button class="btn btn-danger btn-sm" onclick="mergeItems()">Merge</button>
+
       </div>
     </div>
 
@@ -1492,6 +1523,21 @@ panelLoaders['settings'] = async function() {
   document.getElementById('sel-utility').value   = data.utility_mode || 'linear';
   document.getElementById('inp-decay').value     = data.decay_factor || 0.8;
 
+  var aliases = data.aliases || {};
+  var keys = Object.keys(aliases).sort();
+  var aliasList = document.getElementById('alias-list');
+  if (!keys.length) {
+    aliasList.innerHTML = '<div style="color:#8b949e;font-size:.8rem">(no aliases defined)</div>';
+  } else {
+    aliasList.innerHTML = keys.map(function(alias) {
+      return '<div class="alias-row">' +
+        '<span class="alias-name">' + esc(alias) + '</span>' +
+        '<span class="alias-arrow">→</span>' +
+        '<span class="alias-name">' + esc(aliases[alias]) + '</span>' +
+        '<button class="btn btn-danger btn-sm" data-alias="' + esc(alias) +
+        '" onclick="removeAlias(this.dataset.alias)">&#x2715;</button></div>';
+    }).join('');
+  }
 };
 
 async function savePlayerName() {
@@ -1525,13 +1571,27 @@ async function mergePlayers() {
   if (!from_name || !to_name) {
     showMsg('settings-msg', 'Both names required.', 'err'); return;
   }
-  if (!confirm("Merge '" + from_name + "' → '" + to_name + "'?\\nThis rewrites all historical round data and records an alias so the old name is recognised automatically in future.")) return;
+  var sameSpelling = from_name.toLowerCase() === to_name.toLowerCase();
+  var confirmMsg = sameSpelling
+    ? "Recapitalise all occurrences of '" + from_name + "' to '" + to_name + "'?"
+    : "Merge '" + from_name + "' \u2192 '" + to_name + "'?\\nThis rewrites all historical round data and records an alias so the old name is recognised automatically in future.";
+  if (!confirm(confirmMsg)) return;
   var data = await post('/api/settings/merge', {from_name: from_name, to_name: to_name});
   if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
-  showMsg('settings-msg', "Merged '" + esc(data.from) + "' → '" + esc(data.to) +
-    "'. " + data.changed + " occurrence(s) updated.");
+  var msg = sameSpelling
+    ? "Recapitalised '" + esc(data.from) + "' \u2192 '" + esc(data.to) + "'. " + data.changed + " occurrence(s) updated."
+    : "Merged '" + esc(data.from) + "' \u2192 '" + esc(data.to) + "'. " + data.changed + " occurrence(s) updated.";
+  showMsg('settings-msg', msg);
   document.getElementById('inp-merge-from').value = '';
   document.getElementById('inp-merge-into').value = '';
+  panelLoaders['settings']();
+}
+
+async function removeAlias(alias) {
+  var data = await post('/api/settings/alias/remove', {alias: alias});
+  if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
+  showMsg('settings-msg', "Alias '" + esc(alias) + "' removed.");
+  panelLoaders['settings']();
 }
 
 async function mergeItems() {
