@@ -463,14 +463,20 @@ def api_settings_merge():
     from_name = data.get("from_name", "").strip()
     to_name   = data.get("to_name",   "").strip()
 
-    from_canon = canonical_player(from_name, _player_profiles)
-    to_canon   = to_name  # use the exact capitalisation the user typed for the target
+    from_canon  = canonical_player(from_name, _player_profiles)
+    to_resolved = canonical_player(to_name,   _player_profiles)
     if not from_canon:
         return jsonify({"error": f"Player '{from_name}' not found."}), 400
-    if not to_canon:
+    if not to_name.strip():
         return jsonify({"error": "Target name is empty."}), 400
 
-    same_spelling = from_canon.lower() == to_canon.lower()
+    same_spelling = from_canon.lower() == to_name.lower()
+    if same_spelling:
+        # Pure recapitalisation — use the typed form as the new canonical spelling
+        to_canon = to_name
+    else:
+        # Merge — resolve to existing canonical name, or use typed value if new
+        to_canon = to_resolved or to_name
 
     # Recapitalise all historical occurrences
     old_lower = from_canon.lower()
