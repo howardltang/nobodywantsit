@@ -178,8 +178,10 @@ def api_round_save():
         if item not in new_round["items"]:
             new_round["items"][item] = []
 
+    mb_items = _mystery_box_items()
     winners = [
-        {"item": item, "player": players[0], "value": _state["item_values"].get(item, 0)}
+        {"item": item, "player": players[0], "value": _state["item_values"].get(item, 0),
+         "is_mystery_box": item.lower() in mb_items}
         for item, players in new_round["items"].items() if len(players) == 1
     ]
 
@@ -406,6 +408,59 @@ def api_mystats():
                     "wins": wins, "collisions": collisions,
                     "win_rate": round(wins / total_picks * 100, 1) if total_picks else 0,
                     "rows": rows})
+
+
+# ---------------------------------------------------------------------------
+# API — Mystery boxes
+# ---------------------------------------------------------------------------
+
+def _mystery_box_items():
+    """Return the set of canonical mystery-box item names (lowercase)."""
+    mb = _state.get("mystery_boxes", {})
+    return {n.lower() for n in mb.get("items", [])}
+
+def _mystery_box_sync():
+    """Recompute expected_value from observations and update item prices."""
+    mb = _state["mystery_boxes"]
+    obs = mb.get("observations", [])
+    ev = round(sum(obs) / len(obs)) if obs else None
+    mb["expected_value"] = ev
+    if ev is not None:
+        for name in mb.get("items", []):
+            canon = canonical_item(name, _state["item_values"])
+            if canon:
+                _state["item_values"][canon] = float(ev)
+
+
+@app.route("/api/mystery_box/observe", methods=["POST"])
+def api_mystery_box_observe():
+    data  = request.get_json()
+    value = data.get("value")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid value."}), 400
+    if value <= 0:
+        return jsonify({"error": "Value must be positive."}), 400
+
+    mb = _state.setdefault("mystery_boxes", {"items": ["box", "white elephant gift"],
+                                              "observations": [], "expected_value": None})
+    mb.setdefault("observations", []).append(value)
+    _mystery_box_sync()
+    save_state(_state)
+    _retrain()
+    return jsonify({"ok": True, "observations": mb["observations"],
+                    "expected_value": mb["expected_value"]})
+
+
+@app.route("/api/mystery_box/config", methods=["GET"])
+def api_mystery_box_config():
+    mb = _state.get("mystery_boxes", {})
+    return jsonify({
+        "items":          mb.get("items", []),
+        "observations":   mb.get("observations", []),
+        "expected_value": mb.get("expected_value"),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1194,11 +1249,25 @@ async function saveRound() {
   if (!data.winners.length) {
     display.innerHTML = prefix + '<div class="card-sub">No solo winners this round.</div>';
   } else {
-    display.innerHTML = prefix + data.winners.map(function(w) {
-      return '<div class="winner-row">🏆 <strong>' + esc(w.player) +
+    var rows = data.winners.map(function(w) {
+      var valLabel = w.is_mystery_box ? '(mystery)' : fmt(w.value) + ' meat';
+      return '<div class="winner-row">&#x1F3C6; <strong>' + esc(w.player) +
         '</strong> won <strong>' + esc(w.item) + '</strong>' +
-        '<span class="winner-val">' + fmt(w.value) + ' meat</span></div>';
+        '<span class="winner-val">' + valLabel + '</span></div>';
     }).join('');
+    var revealForms = '';
+    data.winners.filter(function(w) { return w.is_mystery_box && !testMode; }).forEach(function(w) {
+      revealForms +=
+        '<div class="card-sub" style="margin-top:.75rem;padding:.6rem;background:#161b22;border-radius:4px;border:1px solid #30363d">' +
+        '<div style="margin-bottom:.4rem">What was the mystery value of <strong>' + esc(w.item) + '</strong>?' +
+        ' <span style="color:#8b949e;font-size:.75rem">(optional)</span></div>' +
+        '<div style="display:flex;gap:.4rem;align-items:center">' +
+        '<input type="number" min="1" class="mystery-reveal-inp" placeholder="Value in meat" style="max-width:160px">' +
+        '<button class="btn btn-primary btn-sm" onclick="submitMysteryReveal(this)">Record</button>' +
+        '<span class="mystery-reveal-msg" style="font-size:.8rem;color:#3fb950"></span>' +
+        '</div></div>';
+    });
+    display.innerHTML = prefix + rows + revealForms;
   }
 
   // Only update topbar round count when actually saved
@@ -1328,6 +1397,7 @@ panelLoaders['players'] = async function() {
 var _itemsData = [];
 var _itemsSort = {col: 'price', dir: -1};
 var _itemFilter = '';
+var _mysteryBoxItems = new Set();
 var _openItemDetail = null;
 
 function filterItems(val) {
@@ -1360,28 +1430,46 @@ function renderItems() {
       '<td class="td-right">' + (r.avg_pickers > 0 ? r.avg_pickers.toFixed(1) : '—') + '</td>' +
       '<td class="td-right"></td>';
 
+    var isMystery = _mysteryBoxItems.has(r.item.toLowerCase());
+
     var nameInp = document.createElement('input');
     nameInp.className = 'editable-cell ec-name';
     nameInp.value = r.item;
     nameInp.dataset.orig = r.item;
-    nameInp.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') this.blur();
-      else if (e.key === 'Escape') { this.value = this.dataset.orig; this.blur(); }
-    });
-    nameInp.addEventListener('blur', function() { renameItem(this); });
+    if (isMystery) {
+      nameInp.readOnly = true;
+      nameInp.title = 'Mystery box item — name cannot be changed here';
+      nameInp.style.color = '#8b949e';
+    } else {
+      nameInp.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') this.blur();
+        else if (e.key === 'Escape') { this.value = this.dataset.orig; this.blur(); }
+      });
+      nameInp.addEventListener('blur', function() { renameItem(this); });
+    }
     tr.querySelector('.item-name-cell').appendChild(nameInp);
 
-    var priceInp = document.createElement('input');
-    priceInp.className = 'editable-cell ec-price';
-    priceInp.value = fmt(r.price);
-    priceInp.dataset.item = r.item;
-    priceInp.dataset.orig = r.price;
-    priceInp.addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') this.blur();
-      else if (e.key === 'Escape') { this.value = fmt(parseFloat(this.dataset.orig)); this.blur(); }
-    });
-    priceInp.addEventListener('blur', function() { updateItemPrice(this); });
-    tr.querySelector('.price-cell').appendChild(priceInp);
+    if (isMystery) {
+      var priceSpan = document.createElement('span');
+      priceSpan.style.cssText = 'color:#8b949e;font-size:.8rem;font-family:monospace;padding:3px 6px;display:block;width:100%;text-align:right';
+      priceSpan.title = 'Derived from mystery box observations — not manually editable';
+      priceSpan.textContent = r.price ? fmt(r.price) : '—';
+      var priceCell = tr.querySelector('.price-cell');
+      priceCell.style.padding = '0';
+      priceCell.appendChild(priceSpan);
+    } else {
+      var priceInp = document.createElement('input');
+      priceInp.className = 'editable-cell ec-price';
+      priceInp.value = fmt(r.price);
+      priceInp.dataset.item = r.item;
+      priceInp.dataset.orig = r.price;
+      priceInp.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') this.blur();
+        else if (e.key === 'Escape') { priceInp.value = fmt(parseFloat(this.dataset.orig)); this.blur(); }
+      });
+      priceInp.addEventListener('blur', function() { updateItemPrice(this); });
+      tr.querySelector('.price-cell').appendChild(priceInp);
+    }
 
     var btn = document.createElement('button');
     btn.className = 'detail-btn';
@@ -1461,7 +1549,12 @@ async function toggleItemDetail(itemName, btn) {
 }
 
 panelLoaders['items-list'] = async function() {
-  _itemsData = await (await fetch('/api/stats/items')).json();
+  var [items, mbConfig] = await Promise.all([
+    fetch('/api/stats/items').then(function(r) { return r.json(); }),
+    fetch('/api/mystery_box/config').then(function(r) { return r.json(); }),
+  ]);
+  _itemsData = items;
+  _mysteryBoxItems = new Set(mbConfig.items.map(function(n) { return n.toLowerCase(); }));
   _itemsSort = {col: 'price', dir: -1};
   _itemFilter = '';
   var searchEl = document.getElementById('items-search');
@@ -1598,6 +1691,20 @@ async function removeAlias(alias) {
   if (data.error) { showMsg('settings-msg', esc(data.error), 'err'); return; }
   showMsg('settings-msg', "Alias '" + esc(alias) + "' removed.");
   panelLoaders['settings']();
+}
+
+async function submitMysteryReveal(btn) {
+  var container = btn.closest('div');
+  var inp = container.querySelector('.mystery-reveal-inp');
+  var msg = container.querySelector('.mystery-reveal-msg');
+  var val = parseFloat(inp.value);
+  if (!val || val <= 0) { msg.style.color = '#f85149'; msg.textContent = 'Enter a valid value.'; return; }
+  var data = await post('/api/mystery_box/observe', {value: val});
+  if (data.error) { msg.style.color = '#f85149'; msg.textContent = esc(data.error); return; }
+  msg.style.color = '#3fb950';
+  msg.textContent = 'Recorded! Expected value now ' + fmt(data.expected_value) + ' meat (' + data.observations.length + ' data point' + (data.observations.length !== 1 ? 's' : '') + ').';
+  inp.disabled = true;
+  btn.disabled = true;
 }
 
 async function mergeItems() {

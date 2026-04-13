@@ -78,6 +78,11 @@ def load_state():
         state.setdefault("name_aliases", {})
         state.setdefault("decay_factor", DEFAULT_DECAY)
         state.setdefault("utility_mode", DEFAULT_UTILITY)
+        state.setdefault("mystery_boxes", {
+            "items":          ["box", "white elephant gift"],
+            "observations":   [],
+            "expected_value": None,
+        })
         return state
     return {
         "rounds":       [],
@@ -85,6 +90,11 @@ def load_state():
         "name_aliases": {},   # {alias_lowercase: canonical_name}
         "decay_factor": DEFAULT_DECAY,
         "utility_mode": DEFAULT_UTILITY,
+        "mystery_boxes": {
+            "items":          ["box", "white elephant gift"],
+            "observations":   [],
+            "expected_value": None,
+        },
     }
 
 def save_state(state):
