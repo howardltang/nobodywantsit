@@ -202,10 +202,18 @@ def api_round_save():
 
 @app.route("/api/stats/players")
 def api_stats_players():
+    # Tally total winnings per player from round history
+    winnings = defaultdict(float)
+    for rd in _state["rounds"]:
+        for item, players in rd["items"].items():
+            if len(players) == 1:
+                winnings[players[0].lower()] += _state["item_values"].get(item, 0)
+
     rows = [
         {"name": name, "picks": p["picks"], "wins": p["wins"],
          "win_rate": round(p["win_rate"] * 100, 1),
-         "contrarian": round(p.get("contrarian", 0), 2)}
+         "contrarian": round(p.get("contrarian", 0), 2),
+         "total_winnings": winnings.get(name.lower(), 0)}
         for name, p in _player_profiles.items() if p.get("picks", 0) >= 1
     ]
     rows.sort(key=lambda x: -x["win_rate"])
@@ -907,9 +915,10 @@ MAIN_HTML = """<!DOCTYPE html>
             <thead><tr>
               <th class="sortable" onclick="sortPlayers('name')">Player<span class="sort-ind" id="psort-name"></span></th>
               <th class="td-right sortable" onclick="sortPlayers('picks')">Picks<span class="sort-ind" id="psort-picks"></span></th>
-              <th class="td-right sortable" onclick="sortPlayers('wins')">Wins<span class="sort-ind" id="psort-wins"> ▼</span></th>
+              <th class="td-right sortable" onclick="sortPlayers('wins')">Wins<span class="sort-ind" id="psort-wins"></span></th>
               <th class="td-right sortable" onclick="sortPlayers('win_rate')">Win%<span class="sort-ind" id="psort-win_rate"></span></th>
               <th class="td-right sortable" onclick="sortPlayers('contrarian')">Contrarian<span class="sort-ind" id="psort-contrarian"></span></th>
+              <th class="td-right sortable" onclick="sortPlayers('total_winnings')">Total Winnings<span class="sort-ind" id="psort-total_winnings"> ▼</span></th>
               <th></th>
             </tr></thead>
             <tbody id="players-tbody"></tbody>
@@ -1064,6 +1073,7 @@ function personalRows(tbody, rows) {
   tbody.innerHTML = '';
   rows.forEach(function(r) {
     var tr = document.createElement('tr');
+    if (!r.won) tr.style.opacity = '0.35';
     var style = r.won ? 'color:#4ade80' : 'color:#f87171';
     var outcome = r.won ? '🏆 Won' : '💥 Collision';
     tr.innerHTML = '<td>' + r.round + '</td><td>' + esc(r.item) + '</td>' +
@@ -1317,6 +1327,7 @@ function renderPlayers() {
       '<td class="td-right">' + r.wins  + '</td>' +
       '<td class="td-right">' + pct(r.win_rate) + '</td>' +
       '<td class="td-right">' + r.contrarian.toFixed(2) + '</td>' +
+      '<td class="td-right td-mono">' + (r.total_winnings > 0 ? fmt(Math.round(r.total_winnings)) : '—') + '</td>' +
       '<td class="td-right"></td>';
     var btn = document.createElement('button');
     btn.className = 'detail-btn';
@@ -1326,7 +1337,7 @@ function renderPlayers() {
     tr.lastElementChild.appendChild(btn);
     tbody.appendChild(tr);
   });
-  ['name','picks','wins','win_rate','contrarian'].forEach(function(c) {
+  ['name','picks','wins','win_rate','contrarian','total_winnings'].forEach(function(c) {
     var el = document.getElementById('psort-' + c);
     if (el) el.textContent = c === col ? (dir === -1 ? ' ▼' : ' ▲') : '';
   });
@@ -1384,7 +1395,7 @@ async function togglePlayerDetail(name, btn) {
 
 panelLoaders['players'] = async function() {
   _playersData = await (await fetch('/api/stats/players')).json();
-  _playersSort = {col: 'wins', dir: -1};
+  _playersSort = {col: 'total_winnings', dir: -1};
   _playerFilter = '';
   var searchEl = document.getElementById('players-search');
   if (searchEl) searchEl.value = '';

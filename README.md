@@ -68,13 +68,13 @@ Steps through the round wizard:
 2. **Set prices** — any item not seen before prompts for a price; typing an existing item name merges a typo with its canonical entry
 3. **Recommendation** — ranked table of all items by EV; item prices are editable inline and rankings refresh automatically
 4. **Enter results** — fill in who picked each item; leave blank for skipped items
-5. **Winners** — solo winners are displayed; round is saved to history
+5. **Winners** — solo winners are displayed; round is saved to history. If a mystery box was won, an optional field appears to record the revealed prize value.
 
 A **Test mode** toggle in the round header runs through the full flow without saving any data.
 
 ### Player Leaderboard
 
-Sortable table of all players showing picks, wins, win rate, and contrarian score. A filter bar narrows the list by name. Click **Details** on any row to expand an inline view of that player's round-by-round pick history.
+Sortable table of all players showing picks, wins, win rate, contrarian score, and total winnings. Defaults to sorting by total winnings. A filter bar narrows the list by name. Click **Details** on any row to expand an inline view of that player's round-by-round pick history, with non-winning picks faded.
 
 ### Item List
 
@@ -82,6 +82,7 @@ Sortable table of all known items. A filter bar narrows the list by name. Click 
 
 - **Item names** are editable inline (click to edit, Enter to save, Escape to cancel)
 - **Prices** are editable inline with the same controls; prices display with thousand separators
+- **Mystery box items** (`box`, `white elephant gift`) show a read-only price derived from observed prize values — see Mystery boxes below
 
 ### My Stats
 
@@ -94,8 +95,18 @@ Shows your personal round-by-round pick history — items picked, outcome, numbe
 | My Player Name | Records which player in the results is you. Enables personal annotations in the recommendation table. |
 | Utility Mode | Scoring function used for recommendations. See Utility modes below. |
 | Recency Decay Factor | Controls how much weight older rounds carry. `0.8` (default) = a round five sessions ago counts ~33% as much as the latest. `1.0` = all rounds weighted equally. |
-| Merge Player Names | Rewrites all historical occurrences of one player name to another. Automatically records an alias so the old name maps to the new one in future rounds. |
+| Merge Player Names | Rewrites all historical occurrences of one player name to another. If the names differ only in capitalisation, renames all occurrences without recording an alias. Otherwise records an alias automatically so the old name is recognised in future rounds. Expand "Current aliases" to view or delete existing aliases. |
 | Merge Items | Combines two items into one, rewriting all historical round data. The source item is removed from the item list. |
+
+---
+
+## Mystery boxes
+
+`box` and `white elephant gift` are mystery items whose prize value is unknown at pick time and shared from the same prize pool. Their price is derived from observed prize values rather than set manually.
+
+Every time someone wins a mystery box and the value is revealed, you can record it on the winners screen. The expected value (simple mean of all observations) is automatically recalculated and both item prices are updated.
+
+Because the price is model-derived, these items cannot be manually renamed or repriced in the Item List.
 
 ---
 
@@ -164,7 +175,7 @@ This means the model correctly assigns high P(solo) to consistently ignored item
 
 ## Player tracking
 
-The **Player Leaderboard** shows wins, win rate, and a contrarian score for all players. The contrarian score reflects how often a player avoids the items that others crowd onto. Click **Details** on any row to see that player's full round-by-round pick history.
+The **Player Leaderboard** shows picks, wins, win rate, contrarian score, and total winnings for all players, defaulting to sort by total winnings. The contrarian score reflects how often a player avoids items that others crowd onto. Click **Details** on any row to see that player's full round-by-round pick history, with non-winning picks faded for easy scanning.
 
 **My Stats** shows the same view for your own player name, which can be set in Settings.
 
@@ -180,6 +191,7 @@ All data lives in `nwi_state.json`. It contains:
 - `name_aliases` — dict of `{alias_lowercase: canonical_name}` (managed automatically by player merges)
 - `decay_factor` — recency decay weight (default `0.8`)
 - `utility_mode` — scoring function for recommendations (`linear`, `sqrt`, or `log`)
+- `mystery_boxes` — dict containing `items` (list of mystery box item names), `observations` (list of recorded prize values), and `expected_value` (current mean)
 
 The file is plain JSON and can be edited by hand if needed. It is excluded from version control (see `.gitignore`) as it contains personal player data.
 
