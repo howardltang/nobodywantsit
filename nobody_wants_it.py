@@ -17,6 +17,7 @@ Usage:
 
 import json
 import os
+import re
 import numpy as np
 from collections import defaultdict
 
@@ -27,6 +28,20 @@ SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nwi_state.
 # Names are stored in their original casing but
 # all lookups are case-insensitive via these helpers.
 # ─────────────────────────────────────────────
+
+_MULT_RE = re.compile(r'^(.*?)\s*\((\d+)\)\s*$')
+
+def parse_multiplier(text):
+    """
+    If text ends with (N) where N is a plain positive integer, return (base_name, N).
+    Items like "Arrow (+1)" don't match because "+1" contains non-digit characters.
+    "Arrow (+1) (5)" → ("Arrow (+1)", 5)
+    """
+    m = _MULT_RE.match(text.strip())
+    if m and int(m.group(2)) > 0:
+        return m.group(1).strip(), int(m.group(2))
+    return text.strip(), 1
+
 
 def canonical_item(name, item_values):
     """Return the stored key whose lowercase matches name.lower(), or None."""
@@ -161,134 +176,163 @@ def build_player_profiles(rounds):
 # This means items skipped every round → λ_others ≈ 0 → P(solo) ≈ 100%,
 # which is exactly the right answer: "if I pick this, I'll be alone."
 
-PRIOR_STRENGTH = 1.0   # pseudo-observations the prior represents (low = trust history fast)
+PRIOR_STRENGTH   = 1.0   # pseudo-observations the prior represents (low = trust history fast)
+ZERO_SKIP_PSEUDO = 0.4   # pseudo-obs used when item has only zero-pick appearances
+PRIOR_LAM_MIN    = 0.1   # λ_others prior for the cheapest item in a round
+PRIOR_LAM_MAX    = 3.0   # λ_others prior for the most expensive item in a round
 
 def _p_solo_from_lambda(lam_others):
     """P(0 other pickers) = e^(-λ_others)."""
     return float(np.exp(-lam_others))
 
-def _value_lam_others(value, all_values_in_round, n_players):
+def _value_lam_others(value, all_values_in_round,
+                      lam_min=PRIOR_LAM_MIN, lam_max=PRIOR_LAM_MAX):
     """
     Prior λ_others for items with no history, based on value rank.
-    Conservatively assumes 0–3 other pickers depending on value.
-    This prior is quickly overridden once real data exists.
+    Linear from lam_min (cheapest) to lam_max (most expensive) in the round.
+    This prior is quickly overridden once real data accumulates.
     """
     known = sorted(v for v in all_values_in_round if v > 0)
     if value > 0 and known:
         pct = known.index(value) / max(len(known) - 1, 1) if value in known else 0.5
     else:
         pct = 0.5
-    # Range: 0.1 others (cheapest) to 3.0 others (most expensive)
-    # Deliberately narrow so history dominates quickly.
-    return 0.1 + pct * 2.9
+    return lam_min + pct * (lam_max - lam_min)
 
 
-DEFAULT_DECAY    = 0.8      # weight of round N-1 relative to round N
-DEFAULT_UTILITY = "linear"  # scoring function: "linear", "sqrt", or "log"
+DEFAULT_DECAY          = 0.89   # weight of round N-1 relative to round N
+DEFAULT_EXP_POWER      = 0.65   # exponent for "exp" utility mode
+DEFAULT_NORMALIZE      = True   # normalize λ_others by historical round size
+DEFAULT_UTILITY        = "linear"  # scoring function: "linear", "exp", or "log"
 
 UTILITY_LABELS = {
     "linear": "EV = price × P(solo)",
-    "sqrt":   "EV = √price × P(solo)  [risk-adjusted]",
+    "exp":    f"EV = price^{DEFAULT_EXP_POWER} × P(solo)  [risk-adjusted]",
     "log":    "EV = log(price) × P(solo)  [Kelly-style]",
 }
 
 class NWIModel:
     def __init__(self):
-        self.item_history = {}   # item → {appearances: [(round_idx, count)], wins: int}
+        self.item_history = {}   # item → {appearances: [(round_idx, count, pickers_frozenset)], wins: int}
         self.n_rounds     = 0
         self.decay        = DEFAULT_DECAY
 
     def _rebuild_history(self, rounds):
         hist = defaultdict(lambda: {"appearances": [], "wins": 0})
+        round_sizes = {}
         for r_idx, rd in enumerate(rounds):
+            n_part = len(frozenset(
+                p.lower() for pickers in rd["items"].values() for p in pickers
+            ))
+            round_sizes[r_idx] = n_part
             for item, players in rd["items"].items():
-                count = len(players)
-                hist[item]["appearances"].append((r_idx, count))
+                count   = len(players)
+                pickers = frozenset(p.lower() for p in players)
+                hist[item]["appearances"].append((r_idx, count, pickers))
                 if count == 1:
                     hist[item]["wins"] += 1
-        self.item_history = dict(hist)
-        self.n_rounds = len(rounds)
+        self.item_history  = dict(hist)
+        self._round_sizes  = round_sizes
+        self.n_rounds      = len(rounds)
 
-    def train(self, rounds, player_profiles, item_values, decay=None):
+    def train(self, rounds, decay=None,
+              normalize_round_size=DEFAULT_NORMALIZE):
         """Build item history from all past rounds."""
         if decay is not None:
             self.decay = decay
+        self._normalize_round_size = normalize_round_size
         self._rebuild_history(rounds)
         n_appearances = sum(len(h["appearances"]) for h in self.item_history.values())
         n_wins        = sum(h["wins"]             for h in self.item_history.values())
         n_skipped     = sum(1 for h in self.item_history.values()
-                            for _, c in h["appearances"] if c == 0)
+                            for _, c, _ in h["appearances"] if c == 0)
         decay_str = f", decay={self.decay:.2f}" if self.decay < 1.0 else ", no decay"
         print(f"  [Model] Bayesian estimator loaded "
               f"({n_appearances} item-appearances, {n_wins} solo wins, "
               f"{n_skipped} zero-pick appearances, across {len(rounds)} rounds"
               f"{decay_str})")
 
-    def _weighted_lam_others(self, appearances):
+    def _weighted_lam_others(self, appearances, my_player=None, normalize=False):
         """
-        Compute a decay-weighted estimate of λ_others from a list of
-        (round_idx, total_pick_count) tuples.
+        Compute a decay-weighted estimate of λ_others.
 
-        Each appearance contributes:
-          - others = max(count - 1, 0)  (skipped rounds → 0 others)
-          - weight = decay ^ (n_rounds - 1 - round_idx)
-            so the most recent round always has weight 1.0
+        normalize=True  — returns a pick *rate* (others / (round_size - 1)) so
+                          the caller can scale to the current round's player count.
+        normalize=False — returns raw weighted count (legacy behaviour).
 
-        Returns (weighted_mean_others, effective_n) where effective_n is
-        the sum of weights (used for prior blending).
+        Returns (weighted_mean, effective_n).
         """
         if not appearances:
             return 0.0, 0.0
 
         total_w  = 0.0
         total_wo = 0.0
-        for r_idx, count in appearances:
-            age    = (self.n_rounds - 1) - r_idx   # 0 = most recent
-            w      = self.decay ** age
-            others = max(count - 1, 0)
+        for r_idx, count, pickers in appearances:
+            age = (self.n_rounds - 1) - r_idx
+            w   = self.decay ** age
+            if my_player is not None:
+                others = count - (1 if my_player in pickers else 0)
+            else:
+                others = max(count - 1, 0)
+            if normalize:
+                denom  = max(self._round_sizes.get(r_idx, 1) - 1, 1)
+                others = others / denom
             total_w  += w
             total_wo += w * others
 
         weighted_mean = total_wo / total_w if total_w > 0 else 0.0
         return weighted_mean, total_w
 
-    def _p_solo_for_item(self, item, value, all_values_in_round, n_players, n_items):
+    def _p_solo_for_item(self, item, value, all_values_in_round, n_players,
+                         my_player=None):
         """
         P(I win | I pick this item) = e^(-λ_others).
 
-        λ_others is a decay-weighted mean of (total_pickers - 1) per appearance,
-        smoothed toward a value-based prior.
+        λ_others is a decay-weighted mean of others-per-appearance, smoothed
+        toward a value-based prior. When my_player (lowercase) is supplied,
+        uses exact membership rather than the count-1 heuristic.
         """
-        h = self.item_history.get(item)
+        h          = self.item_history.get(item)
+        normalize  = getattr(self, "_normalize_round_size", False)
 
         if h and h["appearances"]:
-            obs_lam, eff_n = self._weighted_lam_others(h["appearances"])
+            obs_stat, eff_n = self._weighted_lam_others(
+                h["appearances"], my_player=my_player, normalize=normalize
+            )
+            if normalize:
+                obs_lam = obs_stat * max(n_players - 1, 1)
+            else:
+                obs_lam = obs_stat
+            prior_lam = _value_lam_others(value, all_values_in_round)
 
-            prior_lam = _value_lam_others(value, all_values_in_round, n_players)
-
-            # Reduce prior influence when item has consistently zero picks
-            all_skipped = all(c == 0 for _, c in h["appearances"])
-            pseudo = 0.5 if all_skipped else PRIOR_STRENGTH
-            w_obs  = eff_n / (eff_n + pseudo)
+            all_skipped  = all(c == 0 for _, c, _ in h["appearances"])
+            pseudo       = ZERO_SKIP_PSEUDO if all_skipped else PRIOR_STRENGTH
+            w_obs        = eff_n / (eff_n + pseudo)
 
             lam_others = w_obs * obs_lam + (1 - w_obs) * prior_lam
             return _p_solo_from_lambda(lam_others)
 
         else:
-            lam_others = _value_lam_others(value, all_values_in_round, n_players)
+            lam_others = _value_lam_others(value, all_values_in_round)
             return _p_solo_from_lambda(lam_others)
 
-    def score_items(self, items_with_values, all_players, player_profiles,
-                    utility="linear"):
+    def score_items(self, items_with_values, all_players,
+                    utility="linear", my_player=None, exp_power=DEFAULT_EXP_POWER):
         n_players = len(all_players)
-        n_items   = len(items_with_values)
         all_vals  = list(items_with_values.values())
         results   = []
 
+        # Use personalised λ_others when my_player is an active participant
+        players_lower = {p.lower() for p in all_players}
+        perspective   = (my_player.lower()
+                         if my_player and my_player.lower() in players_lower
+                         else None)
+
         for item, value in items_with_values.items():
-            p_solo = self._p_solo_for_item(item, value, all_vals, n_players, n_items)
-            if utility == "sqrt":
-                ev = float(np.sqrt(max(value, 0))) * p_solo
+            p_solo = self._p_solo_for_item(item, value, all_vals, n_players,
+                                           my_player=perspective)
+            if utility == "exp":
+                ev = float(max(value, 0) ** exp_power) * p_solo
             elif utility == "log":
                 ev = float(np.log1p(max(value, 0))) * p_solo
             else:
@@ -297,9 +341,9 @@ class NWIModel:
             h = self.item_history.get(item)
             if h and h["appearances"]:
                 n_app     = len(h["appearances"])
-                n_picked  = sum(1 for _, c in h["appearances"] if c > 0)
+                n_picked  = sum(1 for _, c, _ in h["appearances"] if c > 0)
                 n_skipped = n_app - n_picked
-                avg = (sum(c for _, c in h["appearances"] if c > 0) / n_picked
+                avg = (sum(c for _, c, _ in h["appearances"] if c > 0) / n_picked
                        if n_picked else 0.0)
                 skip_note = f", skipped {n_skipped}×" if n_skipped else ""
                 hist_str  = f"{n_app} appearances, avg {avg:.1f} picks/round{skip_note}"
@@ -325,7 +369,7 @@ def print_banner():
 
 def show_recommendations(results, my_player=None, item_history=None, utility="linear"):
     W = 72
-    ev_label = {"linear": "EV", "sqrt": "EV(√)", "log": "EV(log)"}.get(utility, "EV")
+    ev_label = {"linear": "EV", "exp": "EV(^.57)", "log": "EV(log)"}.get(utility, "EV")
     print(f"\n{'─'*W}")
     print(f"{'#':<4} {'ITEM':<28} {'PRICE':>9} {'P(SOLO)':>8} {ev_label:>10}  NOTES")
     print(f"{'─'*W}")
@@ -573,6 +617,7 @@ def browse_item_pickers(state):
         print()
 
 
+def merge_player_names(state, player_profiles):
     """
     Interactive: rename all occurrences of one player name into another,
     across every round in the state file. Also updates my_player if affected.
@@ -838,9 +883,9 @@ def run_round(state, model, player_profiles):
     print("\nWould you like a recommendation? (y/n)")
     if input("> ").strip().lower() == 'y':
         utility = state.get("utility_mode", DEFAULT_UTILITY)
-        results = model.score_items(round_items, participants, player_profiles,
-                                    utility=utility)
         my_player = state.get("my_player")
+        results = model.score_items(round_items, participants,
+                                    utility=utility, my_player=my_player)
         my_item_hist = build_my_item_history(state["rounds"], my_player) if my_player else None
         show_recommendations(results, my_player=my_player, item_history=my_item_hist,
                              utility=utility)
@@ -908,8 +953,7 @@ def run_round(state, model, player_profiles):
     save_state(state)
 
     player_profiles = build_player_profiles(state["rounds"])
-    model.train(state["rounds"], player_profiles, state["item_values"],
-                decay=state.get("decay_factor", DEFAULT_DECAY))
+    model.train(state["rounds"], decay=state.get("decay_factor", DEFAULT_DECAY))
 
     return state, player_profiles
 
@@ -928,8 +972,7 @@ def main():
     model = NWIModel()
     if state["rounds"]:
         print("[Training on saved data...]")
-        model.train(state["rounds"], player_profiles, state["item_values"],
-                    decay=state.get("decay_factor", DEFAULT_DECAY))
+        model.train(state["rounds"], decay=state.get("decay_factor", DEFAULT_DECAY))
     else:
         print("  No rounds yet — model will train after your first round.")
 
@@ -1043,8 +1086,7 @@ def main():
                             else:
                                 state["decay_factor"] = new_decay
                                 save_state(state)
-                                model.train(state["rounds"], player_profiles,
-                                            state["item_values"], decay=new_decay)
+                                model.train(state["rounds"], decay=new_decay)
                                 print(f"  ✓ Decay factor set to {new_decay:.2f}. Model retrained.")
                         except ValueError:
                             print("  [!] Please enter a number.")
@@ -1057,7 +1099,7 @@ def main():
                         marker = " ←" if key == utility else ""
                         print(f"    [{key}]  {desc}{marker}")
                     print()
-                    print("  Enter 'linear', 'sqrt', or 'log', or blank to keep:")
+                    print("  Enter 'linear', 'exp', or 'log', or blank to keep:")
                     raw = input("  > ").strip().lower()
                     if not raw:
                         print("  (unchanged)")
@@ -1066,7 +1108,7 @@ def main():
                         save_state(state)
                         print(f"  ✓ Utility mode set to '{raw}'.")
                     else:
-                        print("  [!] Invalid choice. Enter 'linear', 'sqrt', or 'log'.")
+                        print("  [!] Invalid choice. Enter 'linear', 'exp', or 'log'.")
 
                 elif sub == "0":
                     break

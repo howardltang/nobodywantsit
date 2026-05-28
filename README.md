@@ -94,7 +94,7 @@ Shows your personal round-by-round pick history — items picked, outcome, numbe
 |---------|-------------|
 | My Player Name | Records which player in the results is you. Enables personal annotations in the recommendation table. |
 | Utility Mode | Scoring function used for recommendations. See Utility modes below. |
-| Recency Decay Factor | Controls how much weight older rounds carry. `0.8` (default) = a round five sessions ago counts ~33% as much as the latest. `1.0` = all rounds weighted equally. |
+| Recency Decay Factor | Controls how much weight older rounds carry. `0.89` (default) = a round five sessions ago counts ~56% as much as the latest. `1.0` = all rounds weighted equally. |
 | Merge Player Names | Rewrites all historical occurrences of one player name to another. If the names differ only in capitalisation, renames all occurrences without recording an alias. Otherwise records an alias automatically so the old name is recognised in future rounds. Expand "Current aliases" to view or delete existing aliases. |
 | Merge Items | Combines two items into one, rewriting all historical round data. The source item is removed from the item list. |
 
@@ -152,10 +152,10 @@ The EV column can be scored three ways, configurable in Settings:
 | Mode | Formula | Best for |
 |------|---------|---------|
 | `linear` (default) | `price × P(solo)` | Maximum raw expected value |
-| `sqrt` | `√price × P(solo)` | Risk-adjusted — reduces dominance of extreme prices |
+| `exp` | `price^0.65 × P(solo)` | Risk-adjusted — reduces dominance of extreme prices while still rewarding high value |
 | `log` | `log(price) × P(solo)` | Kelly-style — best long-run growth over many rounds |
 
-In backtesting, `sqrt` correctly identified actual solo winners ~6× more often than `linear`, because `linear` is dominated by ultra-high-value items that are always heavily contested.
+In backtesting, `exp` outperformed `linear` by identifying solo wins on high-value items that `linear` over-weights and crowds out, while not fully discounting them the way `log` does.
 
 ---
 
@@ -163,13 +163,21 @@ In backtesting, `sqrt` correctly identified actual solo winners ~6× more often 
 
 The estimator is a **Bayesian Poisson model** — no external ML libraries required beyond numpy.
 
-For each item, it tracks:
-- How many players picked it each round it appeared (excluding yourself, since you are the decision-maker)
-- How many rounds it appeared but nobody picked it at all ("skipped" rounds)
+### λ estimation
 
-The average number of other pickers per round — counting skipped rounds as zero — becomes λ. A small value-based prior is blended in for items with limited history, and that prior's influence diminishes quickly as data accumulates. After around four appearances, the observed history dominates almost entirely.
+For each item, the model tracks every round it appeared: how many players picked it, and whether it was skipped entirely (zero picks). The number of *other* pickers per round is decay-weighted — recent rounds count more than older ones (default decay factor: 0.89, meaning a round 10 sessions ago carries about 31% of the weight of the latest round).
 
-This means the model correctly assigns high P(solo) to consistently ignored items, even if they have moderate value.
+Pick counts are **normalised by round size**: the model tracks pick *rate* (others / players present) rather than raw counts, then scales back to the current round's player count. This means historical rounds with different group sizes are comparable.
+
+### Bayesian smoothing
+
+The decay-weighted observed rate is blended with a **value-based prior** — a new item's prior λ ranges from 0.1 (cheapest item in the round) to 3.0 (most expensive), on the assumption that expensive items attract more competition. The prior's weight is 1 pseudo-observation; after roughly four real appearances the observed history dominates entirely.
+
+**Zero-skip items** (appeared multiple times and were never picked by anyone) use a tighter prior weight of 0.4, so the model becomes confident sooner that these items are genuinely uncontested.
+
+### Scoring
+
+EV is computed as `price^0.65 × P(solo)` in the default `exp` utility mode. The 0.65 exponent is risk-adjusted: it still rewards expensive items but discounts the extreme tail enough that the model doesn't obsess over high-value items that are always heavily contested.
 
 ---
 
@@ -189,8 +197,8 @@ All data lives in `nwi_state.json`. It contains:
 - `item_values` — dict of item name → price
 - `my_player` — your player name, if set
 - `name_aliases` — dict of `{alias_lowercase: canonical_name}` (managed automatically by player merges)
-- `decay_factor` — recency decay weight (default `0.8`)
-- `utility_mode` — scoring function for recommendations (`linear`, `sqrt`, or `log`)
+- `decay_factor` — recency decay weight (default `0.89`)
+- `utility_mode` — scoring function for recommendations (`linear`, `exp`, or `log`)
 - `mystery_boxes` — dict containing `items` (list of mystery box item names), `observations` (list of recorded prize values), and `expected_value` (current mean)
 
 The file is plain JSON and can be edited by hand if needed. It is excluded from version control (see `.gitignore`) as it contains personal player data.
